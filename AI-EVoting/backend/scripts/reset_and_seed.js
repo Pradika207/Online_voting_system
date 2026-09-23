@@ -95,8 +95,16 @@ CREATE TABLE audit_logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER,
   action TEXT NOT NULL,
+  prev_hash TEXT,
+  event_hash TEXT,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY(user_id) REFERENCES users(id)
+);
+
+CREATE TABLE audit_chain_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  last_event_id INTEGER,
+  last_event_hash TEXT
 );
 `;
 

@@ -110,8 +110,16 @@ if (useSqlite) {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER,
       action TEXT NOT NULL,
+      prev_hash TEXT,
+      event_hash TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(user_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_chain_state (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      last_event_id INTEGER,
+      last_event_hash TEXT
     );
   `
 
@@ -193,6 +201,39 @@ if (useSqlite) {
                   return
                 }
 
+                db.all('PRAGMA table_info(audit_logs)', [], (auditPragmaErr, auditColumns) => {
+                  if (auditPragmaErr) {
+                    console.error('SQLite audit migration check failed:', auditPragmaErr)
+                    return
+                  }
+
+                  const auditColumnNames = new Set((auditColumns || []).map((column) => column.name))
+                  const auditMigrations = []
+                  if (!auditColumnNames.has('prev_hash')) auditMigrations.push("ALTER TABLE audit_logs ADD COLUMN prev_hash TEXT")
+                  if (!auditColumnNames.has('event_hash')) auditMigrations.push("ALTER TABLE audit_logs ADD COLUMN event_hash TEXT")
+
+                  const runAuditMigration = () => {
+                    if (auditMigrations.length === 0) {
+                      db.run("CREATE TABLE IF NOT EXISTS audit_chain_state (id INTEGER PRIMARY KEY CHECK (id = 1), last_event_id INTEGER, last_event_hash TEXT)", (auditStateErr) => {
+                        if (auditStateErr) {
+                          console.error('SQLite audit state migration failed:', auditStateErr)
+                          return
+                        }
+                        runBallotMigration()
+                      })
+                      return
+                    }
+
+                    db.run(auditMigrations.shift(), (auditMigrationErr) => {
+                      if (auditMigrationErr) {
+                        console.error('SQLite audit migration failed:', auditMigrationErr)
+                        return
+                      }
+                      runAuditMigration()
+                    })
+                  }
+
+                  const runBallotMigration = () => {
                 db.run("DROP INDEX IF EXISTS votes_one_person_one_vote", (indexErr) => {
                   if (indexErr) {
                     console.error('SQLite legacy vote index migration failed:', indexErr)
@@ -250,6 +291,10 @@ if (useSqlite) {
                       })
                     })
                   })
+                })
+                  }
+
+                  runAuditMigration()
                 })
               })
             })

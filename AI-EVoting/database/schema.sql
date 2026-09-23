@@ -96,5 +96,13 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     id SERIAL PRIMARY KEY,
     user_id INT REFERENCES users(id),
     action VARCHAR(100) NOT NULL,
+    prev_hash TEXT,
+    event_hash TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS audit_chain_state (
+    id INT PRIMARY KEY CHECK (id = 1),
+    last_event_id INT,
+    last_event_hash TEXT
 );

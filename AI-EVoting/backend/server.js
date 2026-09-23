@@ -119,11 +119,21 @@ async function countVerifiedBallots(electionId) {
     )
     : await pool.query("SELECT id, election_id, iv, ciphertext, auth_tag, ballot_hash FROM ballots ORDER BY id");
   const counts = new Map();
+  let invalidCount = 0;
   for (const ballot of ballots.rows) {
-    const payload = decryptBallot(ballot);
-    counts.set(Number(payload.candidateId), (counts.get(Number(payload.candidateId)) || 0) + 1);
+    try {
+      const payload = decryptBallot(ballot);
+      const candidate = await pool.query("SELECT id, election_id FROM candidates WHERE id = $1", [payload.candidateId]);
+      if (candidate.rows.length === 0 || (candidate.rows[0].election_id && Number(candidate.rows[0].election_id) !== Number(ballot.election_id))) {
+        throw new Error("Ballot candidate is not valid for its election");
+      }
+      counts.set(Number(payload.candidateId), (counts.get(Number(payload.candidateId)) || 0) + 1);
+    } catch (error) {
+      invalidCount += 1;
+      await logAudit(null, "BALLOT_INTEGRITY_FAILURE");
+    }
   }
-  return { total: ballots.rows.length, counts };
+  return { total: ballots.rows.length - invalidCount, invalid: invalidCount, counts };
 }
 
 function normalizePhone(phone) {
@@ -161,16 +171,88 @@ const loginLimiter = rateLimit({
   message: { message: "Too many login attempts. Try again later." }
 });
 
-// Helper: audit logging
-async function logAudit(userId, action) {
-  try {
-    await pool.query(
-      `INSERT INTO audit_logs (user_id, action) VALUES ($1, $2)`,
-      [userId || null, action]
-    );
-  } catch (err) {
-    console.error("Failed to write audit log:", err);
+let auditChainReady;
+let auditChainTail = Promise.resolve();
+
+function auditEventHash(event, previousHash) {
+  return crypto.createHash("sha256")
+    .update(JSON.stringify({
+      id: event.id,
+      user_id: event.user_id || null,
+      action: event.action,
+      created_at: event.created_at,
+      prev_hash: previousHash || "",
+    }))
+    .digest("hex");
+}
+
+async function ensureAuditChain() {
+  if (!auditChainReady) {
+    auditChainReady = (async () => {
+      const result = await pool.query("SELECT id, user_id, action, created_at, prev_hash, event_hash FROM audit_logs ORDER BY id");
+      const needsBootstrap = result.rows.some((event) => !event.event_hash || event.prev_hash === null || event.prev_hash === undefined);
+      let previousHash = "";
+
+      for (const event of result.rows) {
+        const eventHash = auditEventHash(event, previousHash);
+        if (needsBootstrap || event.prev_hash !== previousHash || event.event_hash !== eventHash) {
+          await pool.query("UPDATE audit_logs SET prev_hash = $1, event_hash = $2 WHERE id = $3", [previousHash || null, eventHash, event.id]);
+        }
+        previousHash = eventHash;
+      }
+
+      const state = await pool.query("SELECT id FROM audit_chain_state WHERE id = 1");
+      if (state.rows.length === 0) {
+        await pool.query("INSERT INTO audit_chain_state (id, last_event_id, last_event_hash) VALUES (1, $1, $2)", [result.rows.length ? result.rows[result.rows.length - 1].id : null, previousHash || null]);
+      } else if (result.rows.length) {
+        await pool.query("UPDATE audit_chain_state SET last_event_id = $1, last_event_hash = $2 WHERE id = 1", [result.rows[result.rows.length - 1].id, previousHash]);
+      }
+    })().catch((error) => {
+      auditChainReady = null;
+      throw error;
+    });
   }
+  return auditChainReady;
+}
+
+async function logAudit(userId, action) {
+  auditChainTail = auditChainTail.catch(() => {}).then(async () => {
+    try {
+      await ensureAuditChain();
+      const state = await pool.query("SELECT last_event_id, last_event_hash FROM audit_chain_state WHERE id = 1");
+      const previousHash = state.rows[0]?.last_event_hash || "";
+      const inserted = await pool.query(
+        `INSERT INTO audit_logs (user_id, action, prev_hash) VALUES ($1, $2, $3) RETURNING id`,
+        [userId || null, action, previousHash || null]
+      );
+      const eventResult = await pool.query("SELECT id, user_id, action, created_at, prev_hash FROM audit_logs WHERE id = $1", [inserted.rows[0].id]);
+      const event = eventResult.rows[0];
+      const eventHash = auditEventHash(event, previousHash);
+      await pool.query("UPDATE audit_logs SET event_hash = $1 WHERE id = $2", [eventHash, event.id]);
+      const updatedState = await pool.query("UPDATE audit_chain_state SET last_event_id = $1, last_event_hash = $2 WHERE id = 1", [event.id, eventHash]);
+      if (!updatedState.rowCount) await pool.query("INSERT INTO audit_chain_state (id, last_event_id, last_event_hash) VALUES (1, $1, $2)", [event.id, eventHash]);
+    } catch (error) {
+      console.error("Failed to write audit log:", error);
+    }
+  });
+  return auditChainTail;
+}
+
+async function verifyAuditChain() {
+  const result = await pool.query("SELECT id, user_id, action, created_at, prev_hash, event_hash FROM audit_logs ORDER BY id");
+  const stateResult = await pool.query("SELECT last_event_id, last_event_hash FROM audit_chain_state WHERE id = 1");
+  let previousHash = "";
+  let valid = true;
+
+  for (const event of result.rows) {
+    const expectedHash = auditEventHash(event, previousHash);
+    if (event.prev_hash !== (previousHash || null) || event.event_hash !== expectedHash) valid = false;
+    previousHash = event.event_hash || expectedHash;
+  }
+
+  const state = stateResult.rows[0];
+  if ((state?.last_event_id || null) !== (result.rows.length ? result.rows[result.rows.length - 1].id : null) || (state?.last_event_hash || null) !== (previousHash || null)) valid = false;
+  return { valid, eventCount: result.rows.length, lastEventId: state?.last_event_id || null };
 }
 
 app.get("/", (req, res) => {
@@ -884,11 +966,6 @@ app.post("/api/vote", authenticateToken, async (req, res) => {
             [userId, login_attempts, failed_logins, votes_per_minute, ip_changes, device_changes, session_duration]
           );
 
-          await client.query(
-            `INSERT INTO audit_logs (user_id, action) VALUES ($1, $2)`,
-            [userId, 'VOTE_SUCCESS']
-          );
-
           await client.query('COMMIT');
         } catch (dbErr) {
           await client.query('ROLLBACK');
@@ -898,6 +975,8 @@ app.post("/api/vote", authenticateToken, async (req, res) => {
         } finally {
           client.release();
         }
+
+        await logAudit(userId, "VOTE_SUCCESS");
 
         return res.json({ message: 'Vote successfully recorded in demo mode', transactionHash: `demo-${Date.now()}` });
       }
@@ -954,11 +1033,6 @@ app.post("/api/vote", authenticateToken, async (req, res) => {
           [userId, login_attempts, failed_logins, votes_per_minute, ip_changes, device_changes, session_duration]
         );
 
-        await client.query(
-          `INSERT INTO audit_logs (user_id, action) VALUES ($1, $2)`,
-          [userId, "VOTE_SUCCESS"]
-        );
-
         await client.query("COMMIT");
       } catch (dbErr) {
         await client.query("ROLLBACK");
@@ -968,6 +1042,8 @@ app.post("/api/vote", authenticateToken, async (req, res) => {
       } finally {
         client.release();
       }
+
+      await logAudit(userId, "VOTE_SUCCESS");
 
       res.json({ message: "Vote successfully recorded", transactionHash: receipt.transactionHash || receipt.hash });
     } catch (err) {
@@ -1084,6 +1160,63 @@ app.get(
     }
   }
 );
+
+app.get("/api/admin/audit/verify", authenticateToken, adminOnly, async (req, res) => {
+  try {
+    await ensureAuditChain();
+    res.json(await verifyAuditChain());
+  } catch (error) {
+    console.error("Audit verification error:", error);
+    res.status(500).json({ message: "Failed to verify audit chain" });
+  }
+});
+
+app.get("/api/admin/results/:electionId", authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const electionId = Number(req.params.electionId);
+    if (!Number.isInteger(electionId) || electionId <= 0) return res.status(400).json({ message: "Invalid election ID" });
+    const election = await pool.query("SELECT id, name, status FROM elections WHERE id = $1", [electionId]);
+    if (election.rows.length === 0) return res.status(404).json({ message: "Election not found" });
+
+    const verifiedBallots = await countVerifiedBallots(electionId);
+    const candidates = await pool.query("SELECT id, name, party FROM candidates WHERE election_id = $1 OR election_id IS NULL ORDER BY id", [electionId]);
+    const results = candidates.rows.map((candidate) => ({
+      id: candidate.id,
+      name: candidate.name,
+      party: candidate.party,
+      vote_count: verifiedBallots.counts.get(Number(candidate.id)) || 0,
+    }));
+    const resultHash = crypto.createHash("sha256").update(JSON.stringify({ electionId, results, total: verifiedBallots.total })).digest("hex");
+    await logAudit(req.user.userId, "RESULTS_GENERATED");
+    res.json({ election: election.rows[0], total: verifiedBallots.total, invalid: verifiedBallots.invalid, results, resultHash });
+  } catch (error) {
+    console.error("Secure results error:", error);
+    res.status(500).json({ message: "Failed to generate secure results" });
+  }
+});
+
+app.get("/api/results/latest", authenticateToken, async (req, res) => {
+  try {
+    const electionResult = await pool.query("SELECT id, name, status FROM elections WHERE status = 'completed' ORDER BY id DESC LIMIT 1");
+    if (electionResult.rows.length === 0) return res.status(403).json({ message: "Results are not available until an election is completed" });
+
+    const election = electionResult.rows[0];
+    const verifiedBallots = await countVerifiedBallots(election.id);
+    const candidates = await pool.query("SELECT id, name, party FROM candidates WHERE election_id = $1 OR election_id IS NULL ORDER BY id", [election.id]);
+    const results = candidates.rows.map((candidate) => ({
+      id: candidate.id,
+      name: candidate.name,
+      party: candidate.party,
+      vote_count: verifiedBallots.counts.get(Number(candidate.id)) || 0,
+    }));
+    const resultHash = crypto.createHash("sha256").update(JSON.stringify({ electionId: election.id, results, total: verifiedBallots.total })).digest("hex");
+    await logAudit(req.user.userId, "RESULTS_VIEWED");
+    res.json({ election, total: verifiedBallots.total, invalid: verifiedBallots.invalid, results, resultHash });
+  } catch (error) {
+    console.error("Public results error:", error);
+    res.status(500).json({ message: "Failed to retrieve secure results" });
+  }
+});
 
 const PORT = Number(process.env.PORT || 5002);
 

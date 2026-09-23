@@ -15,3 +15,9 @@ For local development, the defaults are `localhost` and `http://localhost:5173`.
 Votes are stored in the `ballots` table as AES-256-GCM ciphertext with a random 96-bit IV, authentication tag, election-bound associated data, and SHA-256 integrity hash. The ballot record contains no voter ID or candidate ID. Voter eligibility and one-person-one-vote state are stored separately in `election_eligibility`.
 
 Set `BALLOT_ENCRYPTION_KEY` in production to a base64-encoded 32-byte secret supplied by a secret manager. The key is never sent to the frontend or committed to Git. Local development creates a `.ballot-key` file, which is ignored by Git. Rotating this key requires a controlled re-encryption migration before old ballots can be counted.
+
+## Secure Counting and Audit Verification
+
+Counting is backend-only. Each ballot is verified for its SHA-256 record hash, AES-GCM authentication, election binding, and candidate validity before it contributes to results. Invalid ballots are excluded and generate a generic `BALLOT_INTEGRITY_FAILURE` audit event without recording a candidate choice.
+
+Audit events use a SHA-256 chain over canonical event data and the previous event hash. Administrators can verify the chain through the protected `/api/admin/audit/verify` endpoint and generate protected election results through `/api/admin/results/:electionId`.
