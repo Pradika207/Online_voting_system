@@ -21,7 +21,10 @@ if (useSqlite) {
       password TEXT NOT NULL,
       has_voted INTEGER DEFAULT 0,
       role TEXT DEFAULT 'voter',
-      verified INTEGER DEFAULT 1
+      verified INTEGER DEFAULT 1,
+      biometric_credential_id TEXT,
+      biometric_public_key TEXT,
+      biometric_counter INTEGER DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS candidates (
@@ -142,6 +145,9 @@ if (useSqlite) {
       if (!existingColumns.has('phone')) migrations.push("ALTER TABLE users ADD COLUMN phone TEXT")
       if (!existingColumns.has('role')) migrations.push("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'voter'")
       if (!existingColumns.has('verified')) migrations.push("ALTER TABLE users ADD COLUMN verified INTEGER DEFAULT 1")
+      if (!existingColumns.has('biometric_credential_id')) migrations.push("ALTER TABLE users ADD COLUMN biometric_credential_id TEXT")
+      if (!existingColumns.has('biometric_public_key')) migrations.push("ALTER TABLE users ADD COLUMN biometric_public_key TEXT")
+      if (!existingColumns.has('biometric_counter')) migrations.push("ALTER TABLE users ADD COLUMN biometric_counter INTEGER DEFAULT 0")
 
       const runMigration = () => {
         if (migrations.length === 0) {

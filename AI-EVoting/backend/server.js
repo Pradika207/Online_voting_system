@@ -12,9 +12,30 @@ const authenticateToken = require("./middleware/auth");
 const { votingContract, getBlockchainVotes } = require("./blockchain");
 const axios = require("axios");
 const adminOnly = require("./middleware/admin");
+const {
+  generateRegistrationOptions,
+  verifyRegistrationResponse,
+  generateAuthenticationOptions,
+  verifyAuthenticationResponse,
+} = require("@simplewebauthn/server");
 
 const app = express();
 const jwtSecret = process.env.JWT_SECRET || 'dev-secret-change-me';
+const webAuthnRpID = process.env.WEBAUTHN_RP_ID || "localhost";
+const webAuthnOrigin = process.env.WEBAUTHN_ORIGIN || "http://localhost:5173";
+const biometricChallenges = new Map();
+const usedBiometricTokens = new Set();
+
+function saveBiometricChallenge(userId, type, challenge) {
+  biometricChallenges.set(`${userId}:${type}`, { challenge, expiresAt: Date.now() + 120000 });
+}
+
+function takeBiometricChallenge(userId, type, expectedChallenge) {
+  const key = `${userId}:${type}`;
+  const record = biometricChallenges.get(key);
+  biometricChallenges.delete(key);
+  return record && record.expiresAt > Date.now() && record.challenge === expectedChallenge;
+}
 
 function normalizePhone(phone) {
   return String(phone || "").trim();
@@ -173,6 +194,131 @@ app.get("/api/candidates", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: "Failed to fetch candidates" });
+  }
+});
+
+// Biometric enrollment: the browser/OS keeps the private key; the server stores only its public key.
+app.post("/api/biometric/register/options", authenticateToken, async (req, res) => {
+  try {
+    const userResult = await pool.query("SELECT id, email, name, biometric_credential_id FROM users WHERE id = $1", [req.user.userId]);
+    if (userResult.rows.length === 0) return res.status(404).json({ message: "User not found" });
+    const user = userResult.rows[0];
+    const options = await generateRegistrationOptions({
+      rpName: "AI E-Voting",
+      rpID: webAuthnRpID,
+      userID: new TextEncoder().encode(String(user.id)),
+      userName: user.email,
+      userDisplayName: user.name,
+      attestationType: "none",
+      authenticatorSelection: {
+        residentKey: "preferred",
+        userVerification: "required",
+      },
+      excludeCredentials: user.biometric_credential_id ? [{ id: user.biometric_credential_id }] : [],
+    });
+
+    saveBiometricChallenge(user.id, "registration", options.challenge);
+    res.json(options);
+  } catch (error) {
+    console.error("Biometric registration options error:", error);
+    res.status(500).json({ message: "Unable to start biometric enrollment" });
+  }
+});
+
+app.get("/api/biometric/status", authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT biometric_credential_id FROM users WHERE id = $1", [req.user.userId]);
+    res.json({ enrolled: Boolean(result.rows[0] && result.rows[0].biometric_credential_id) });
+  } catch (error) {
+    console.error("Biometric status error:", error);
+    res.status(500).json({ message: "Unable to check biometric status" });
+  }
+});
+
+app.post("/api/biometric/register/verify", authenticateToken, async (req, res) => {
+  try {
+    const optionsChallenge = req.body.optionsChallenge;
+    const response = req.body.response;
+    if (!response || !takeBiometricChallenge(req.user.userId, "registration", optionsChallenge)) {
+      return res.status(400).json({ message: "Biometric enrollment challenge expired or invalid" });
+    }
+
+    const verification = await verifyRegistrationResponse({
+      response,
+      expectedChallenge: optionsChallenge,
+      expectedOrigin: webAuthnOrigin,
+      expectedRPID: webAuthnRpID,
+      requireUserVerification: true,
+    });
+
+    if (!verification.verified) return res.status(400).json({ message: "Biometric enrollment was not verified" });
+
+    const credential = verification.registrationInfo.credential;
+    await pool.query(
+      "UPDATE users SET biometric_credential_id = $1, biometric_public_key = $2, biometric_counter = $3 WHERE id = $4",
+      [credential.id, Buffer.from(credential.publicKey).toString("base64"), credential.counter, req.user.userId]
+    );
+    await logAudit(req.user.userId, "BIOMETRIC_ENROLLED");
+    res.json({ message: "Biometric verification enrolled successfully" });
+  } catch (error) {
+    console.error("Biometric registration verification error:", error);
+    res.status(400).json({ message: "Biometric enrollment failed" });
+  }
+});
+
+app.post("/api/biometric/authenticate/options", authenticateToken, async (req, res) => {
+  try {
+    const userResult = await pool.query("SELECT biometric_credential_id FROM users WHERE id = $1", [req.user.userId]);
+    if (userResult.rows.length === 0 || !userResult.rows[0].biometric_credential_id) {
+      return res.status(400).json({ message: "Enroll biometric verification before voting" });
+    }
+
+    const options = await generateAuthenticationOptions({
+      rpID: webAuthnRpID,
+      userVerification: "required",
+      allowCredentials: [{ id: userResult.rows[0].biometric_credential_id }],
+    });
+    saveBiometricChallenge(req.user.userId, "authentication", options.challenge);
+    res.json(options);
+  } catch (error) {
+    console.error("Biometric authentication options error:", error);
+    res.status(500).json({ message: "Unable to start biometric verification" });
+  }
+});
+
+app.post("/api/biometric/authenticate/verify", authenticateToken, async (req, res) => {
+  try {
+    const optionsChallenge = req.body.optionsChallenge;
+    const response = req.body.response;
+    const userResult = await pool.query("SELECT biometric_credential_id, biometric_public_key, biometric_counter FROM users WHERE id = $1", [req.user.userId]);
+    const user = userResult.rows[0];
+
+    if (!user || !user.biometric_credential_id || !takeBiometricChallenge(req.user.userId, "authentication", optionsChallenge)) {
+      return res.status(400).json({ message: "Biometric challenge expired or invalid" });
+    }
+
+    const verification = await verifyAuthenticationResponse({
+      response,
+      expectedChallenge: optionsChallenge,
+      expectedOrigin: webAuthnOrigin,
+      expectedRPID: webAuthnRpID,
+      requireUserVerification: true,
+      credential: {
+        id: user.biometric_credential_id,
+        publicKey: new Uint8Array(Buffer.from(user.biometric_public_key, "base64")),
+        counter: Number(user.biometric_counter || 0),
+      },
+    });
+
+    if (!verification.verified) return res.status(401).json({ message: "Biometric verification failed" });
+
+    await pool.query("UPDATE users SET biometric_counter = $1 WHERE id = $2", [verification.authenticationInfo.newCounter, req.user.userId]);
+    const biometricToken = jwt.sign({ userId: req.user.userId, purpose: "vote-biometric", nonce: require("crypto").randomBytes(16).toString("hex") }, jwtSecret, { expiresIn: "5m" });
+    await logAudit(req.user.userId, "BIOMETRIC_VERIFIED");
+    res.json({ message: "Biometric verification successful", biometricToken });
+  } catch (error) {
+    console.error("Biometric authentication verification error:", error);
+    res.status(401).json({ message: "Biometric verification failed" });
   }
 });
 
@@ -428,6 +574,25 @@ app.post("/api/vote", authenticateToken, async (req, res) => {
     const { candidateId } = req.body;
 
     const userId = req.user && req.user.userId;
+    const biometricHeader = req.headers["x-biometric-token"];
+
+    if (!biometricHeader) {
+      return res.status(403).json({ message: "Biometric verification is required before voting" });
+    }
+
+    let biometricPayload;
+    try {
+      biometricPayload = jwt.verify(biometricHeader, jwtSecret);
+    } catch (error) {
+      return res.status(403).json({ message: "Biometric verification expired or invalid" });
+    }
+
+    const biometricTokenId = biometricPayload.jti || biometricPayload.nonce;
+    if (biometricPayload.purpose !== "vote-biometric" || biometricPayload.userId !== userId || usedBiometricTokens.has(biometricTokenId)) {
+      return res.status(403).json({ message: "Biometric verification token cannot be reused" });
+    }
+
+    usedBiometricTokens.add(biometricTokenId);
 
     if (!candidateId) {
       return res.status(400).json({ message: "Candidate ID is required" });

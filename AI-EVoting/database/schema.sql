@@ -7,7 +7,10 @@ CREATE TABLE IF NOT EXISTS users (
     phone VARCHAR(30),
     password VARCHAR(255) NOT NULL,
     has_voted BOOLEAN DEFAULT FALSE,
-    verified BOOLEAN DEFAULT TRUE
+    verified BOOLEAN DEFAULT TRUE,
+    biometric_credential_id TEXT,
+    biometric_public_key TEXT,
+    biometric_counter INTEGER DEFAULT 0
 );
 
 -- Ensure a role column exists for admin/voter
