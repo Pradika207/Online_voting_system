@@ -24,6 +24,7 @@ const {
 
 const app = express();
 const jwtSecret = process.env.JWT_SECRET || 'dev-secret-change-me';
+const allowedOrigins = new Set(["http://localhost:5173", "http://localhost:5174"]);
 const webAuthnRpID = process.env.WEBAUTHN_RP_ID || "localhost";
 const webAuthnOrigin = process.env.WEBAUTHN_ORIGIN || "http://localhost:5173";
 const biometricChallenges = new Map();
@@ -160,16 +161,82 @@ app.use(
     origin: ["http://localhost:5173", "http://localhost:5174"]
   })
 );
-app.use(express.json());
+app.use(express.json({ limit: process.env.REQUEST_BODY_LIMIT || "100kb" }));
+
+function trustedBrowserOrigin(req, res, next) {
+  if (["POST", "PUT", "PATCH", "DELETE"].includes(req.method) && req.headers.origin && !allowedOrigins.has(req.headers.origin)) {
+    return res.status(403).json({ message: "Untrusted request origin" });
+  }
+  next();
+}
+
+app.use(trustedBrowserOrigin);
 
 // Rate limiter for login endpoint
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: process.env.NODE_ENV === "production" ? 5 : 50,
+  max: Number(process.env.LOGIN_RATE_MAX || (process.env.NODE_ENV === "production" ? 5 : 20)),
   standardHeaders: true,
   legacyHeaders: false,
   message: { message: "Too many login attempts. Try again later." }
 });
+
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: Number(process.env.API_RATE_MAX || (process.env.NODE_ENV === "production" ? 120 : 240)),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: "Too many requests. Try again later." },
+});
+
+const sensitiveLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: Number(process.env.SENSITIVE_RATE_MAX || (process.env.NODE_ENV === "production" ? 20 : 60)),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: "Too many security-sensitive requests. Try again later." },
+});
+
+app.use("/api", apiLimiter);
+const loginFailures = new Map();
+
+function loginKey(req, email) {
+  return `${req.ip}:${String(email).toLowerCase()}`;
+}
+
+function loginLocked(key) {
+  const state = loginFailures.get(key);
+  if (!state || state.lockedUntil <= Date.now()) return false;
+  return true;
+}
+
+function recordLoginFailure(key) {
+  const state = loginFailures.get(key) || { attempts: 0, lockedUntil: 0 };
+  state.attempts += 1;
+  if (state.attempts >= Number(process.env.ACCOUNT_FAILURE_LIMIT || 5)) {
+    state.lockedUntil = Date.now() + Number(process.env.ACCOUNT_LOCK_MS || 60000);
+    state.attempts = 0;
+  }
+  loginFailures.set(key, state);
+}
+
+function clearLoginFailures(key) {
+  loginFailures.delete(key);
+}
+
+function requireRecentMfa(req, res, next) {
+  if (process.env.REQUIRE_ADMIN_MFA !== "true" || req.user?.role !== "admin") return next();
+  const mfaToken = req.headers["x-mfa-token"];
+  if (!mfaToken) return res.status(403).json({ message: "Recent MFA verification is required" });
+  try {
+    const proof = jwt.verify(mfaToken, jwtSecret);
+    if (proof.purpose !== "mfa" || proof.userId !== req.user.userId) throw new Error("Invalid MFA proof");
+    req.mfaVerified = true;
+    next();
+  } catch (error) {
+    res.status(403).json({ message: "MFA verification is expired or invalid" });
+  }
+}
 
 let auditChainReady;
 let auditChainTail = Promise.resolve();
@@ -327,12 +394,18 @@ app.post(
       }
 
       const { email, password } = req.body;
+      const attemptKey = loginKey(req, email);
+
+      if (loginLocked(attemptKey)) {
+        return res.status(429).json({ message: "Authentication temporarily unavailable. Try again later." });
+      }
 
       const result = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
 
       if (result.rows.length === 0) {
         // Audit: login failed (unknown email)
         await logAudit(null, "LOGIN_FAILED");
+        recordLoginFailure(attemptKey);
         return res.status(401).json({ message: "Invalid email or password" });
       }
 
@@ -343,10 +416,12 @@ app.post(
       if (!passwordMatch) {
         // Audit: login failed for this user
         await logAudit(user.id, "LOGIN_FAILED");
+        recordLoginFailure(attemptKey);
         return res.status(401).json({ message: "Invalid email or password" });
       }
 
-      const token = jwt.sign({ userId: user.id, email: user.email, role: user.role }, jwtSecret, { expiresIn: "1h" });
+      clearLoginFailures(attemptKey);
+      const token = jwt.sign({ userId: user.id, email: user.email, role: user.role }, jwtSecret, { expiresIn: "15m", jwtid: crypto.randomBytes(16).toString("hex") });
 
       // Audit: login success
       await logAudit(user.id, "LOGIN_SUCCESS");
@@ -358,6 +433,12 @@ app.post(
     }
   }
 );
+
+app.post("/api/logout", authenticateToken, (req, res) => {
+  const decoded = jwt.decode(req.accessToken);
+  authenticateToken.revokeToken(req.accessToken, decoded?.exp ? decoded.exp * 1000 : undefined);
+  res.json({ message: "Logged out" });
+});
 
 // Get candidates
 app.get("/api/elections/active", authenticateToken, async (req, res) => {
@@ -391,7 +472,7 @@ app.get("/api/candidates", async (req, res) => {
 });
 
 // Biometric enrollment: the browser/OS keeps the private key; the server stores only its public key.
-app.post("/api/biometric/register/options", authenticateToken, async (req, res) => {
+app.post("/api/biometric/register/options", sensitiveLimiter, authenticateToken, async (req, res) => {
   try {
     const userResult = await pool.query("SELECT id, email, name, biometric_credential_id FROM users WHERE id = $1", [req.user.userId]);
     if (userResult.rows.length === 0) return res.status(404).json({ message: "User not found" });
@@ -428,7 +509,7 @@ app.get("/api/biometric/status", authenticateToken, async (req, res) => {
   }
 });
 
-app.post("/api/biometric/register/verify", authenticateToken, async (req, res) => {
+app.post("/api/biometric/register/verify", sensitiveLimiter, authenticateToken, async (req, res) => {
   try {
     const optionsChallenge = req.body.optionsChallenge;
     const response = req.body.response;
@@ -459,7 +540,7 @@ app.post("/api/biometric/register/verify", authenticateToken, async (req, res) =
   }
 });
 
-app.post("/api/biometric/authenticate/options", authenticateToken, async (req, res) => {
+app.post("/api/biometric/authenticate/options", sensitiveLimiter, authenticateToken, async (req, res) => {
   try {
     const userResult = await pool.query("SELECT biometric_credential_id FROM users WHERE id = $1", [req.user.userId]);
     if (userResult.rows.length === 0 || !userResult.rows[0].biometric_credential_id) {
@@ -479,7 +560,7 @@ app.post("/api/biometric/authenticate/options", authenticateToken, async (req, r
   }
 });
 
-app.post("/api/biometric/authenticate/verify", authenticateToken, async (req, res) => {
+app.post("/api/biometric/authenticate/verify", sensitiveLimiter, authenticateToken, async (req, res) => {
   try {
     const optionsChallenge = req.body.optionsChallenge;
     const response = req.body.response;
@@ -506,7 +587,7 @@ app.post("/api/biometric/authenticate/verify", authenticateToken, async (req, re
     if (!verification.verified) return res.status(401).json({ message: "Biometric verification failed" });
 
     await pool.query("UPDATE users SET biometric_counter = $1 WHERE id = $2", [verification.authenticationInfo.newCounter, req.user.userId]);
-    const biometricToken = jwt.sign({ userId: req.user.userId, purpose: "vote-biometric", nonce: require("crypto").randomBytes(16).toString("hex") }, jwtSecret, { expiresIn: "5m" });
+    const biometricToken = jwt.sign({ userId: req.user.userId, purpose: "mfa", nonce: crypto.randomBytes(16).toString("hex") }, jwtSecret, { expiresIn: "5m", jwtid: crypto.randomBytes(16).toString("hex") });
     await logAudit(req.user.userId, "BIOMETRIC_VERIFIED");
     res.json({ message: "Biometric verification successful", biometricToken });
   } catch (error) {
@@ -515,7 +596,7 @@ app.post("/api/biometric/authenticate/verify", authenticateToken, async (req, re
   }
 });
 
-app.post("/api/voter/eligibility", authenticateToken, async (req, res) => {
+app.post("/api/voter/eligibility", sensitiveLimiter, authenticateToken, async (req, res) => {
   try {
     const electionId = Number(req.body.electionId);
     const biometricHeader = req.headers["x-biometric-token"];
@@ -530,7 +611,7 @@ app.post("/api/voter/eligibility", authenticateToken, async (req, res) => {
     }
 
     const biometricTokenId = biometricPayload.jti || biometricPayload.nonce;
-    if (biometricPayload.purpose !== "vote-biometric" || biometricPayload.userId !== req.user.userId || usedBiometricTokens.has(biometricTokenId)) {
+    if (biometricPayload.purpose !== "mfa" || biometricPayload.userId !== req.user.userId || usedBiometricTokens.has(biometricTokenId)) {
       return res.status(403).json({ message: "Biometric verification token cannot be reused" });
     }
 
@@ -610,7 +691,7 @@ app.get("/api/admin/voters/:id", authenticateToken, adminOnly, async (req, res) 
 });
 
 // Admin: candidate management
-app.post("/api/admin/candidates", authenticateToken, adminOnly, async (req, res) => {
+app.post("/api/admin/candidates", authenticateToken, adminOnly, requireRecentMfa, async (req, res) => {
   try {
     const { name, party, photoUrl, manifesto, electionId } = req.body;
     if (!String(name || "").trim()) return res.status(400).json({ message: "Candidate name is required" });
@@ -629,7 +710,7 @@ app.post("/api/admin/candidates", authenticateToken, adminOnly, async (req, res)
   }
 });
 
-app.put("/api/admin/candidates/:id", authenticateToken, adminOnly, async (req, res) => {
+app.put("/api/admin/candidates/:id", authenticateToken, adminOnly, requireRecentMfa, async (req, res) => {
   try {
     const { name, party, photoUrl, manifesto, electionId } = req.body;
     if (!String(name || "").trim()) return res.status(400).json({ message: "Candidate name is required" });
@@ -649,7 +730,7 @@ app.put("/api/admin/candidates/:id", authenticateToken, adminOnly, async (req, r
   }
 });
 
-app.delete("/api/admin/candidates/:id", authenticateToken, adminOnly, async (req, res) => {
+app.delete("/api/admin/candidates/:id", authenticateToken, adminOnly, requireRecentMfa, async (req, res) => {
   try {
     const result = await pool.query("DELETE FROM candidates WHERE id = $1", [req.params.id]);
     if (!result.rowCount) return res.status(404).json({ message: "Candidate not found" });
@@ -672,7 +753,7 @@ app.get("/api/admin/elections", authenticateToken, adminOnly, async (req, res) =
   }
 });
 
-app.post("/api/admin/elections", authenticateToken, adminOnly, async (req, res) => {
+app.post("/api/admin/elections", authenticateToken, adminOnly, requireRecentMfa, async (req, res) => {
   try {
     const { name, description, startDate, endDate, status } = req.body;
     if (!String(name || "").trim()) return res.status(400).json({ message: "Election name is required" });
@@ -695,7 +776,7 @@ app.post("/api/admin/elections", authenticateToken, adminOnly, async (req, res) 
   }
 });
 
-app.patch("/api/admin/elections/:id/status", authenticateToken, adminOnly, async (req, res) => {
+app.patch("/api/admin/elections/:id/status", authenticateToken, adminOnly, requireRecentMfa, async (req, res) => {
   try {
     const allowedStatuses = ["upcoming", "active", "completed"];
     const status = String(req.body.status || "").toLowerCase();
@@ -724,7 +805,7 @@ app.get("/api/admin/profile", authenticateToken, adminOnly, async (req, res) => 
   }
 });
 
-app.post("/api/admin/change-password", authenticateToken, adminOnly, async (req, res) => {
+app.post("/api/admin/change-password", authenticateToken, adminOnly, requireRecentMfa, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body;
     if (!currentPassword || !newPassword || String(newPassword).length < 8) {
@@ -751,6 +832,7 @@ app.get(
   "/api/admin/dashboard",
   authenticateToken,
   adminOnly,
+  requireRecentMfa,
   async (req, res) => {
 
     try {
@@ -809,7 +891,7 @@ app.get(
 );
 
 // Vote endpoint
-app.post("/api/vote", authenticateToken, async (req, res) => {
+app.post("/api/vote", sensitiveLimiter, authenticateToken, async (req, res) => {
   try {
     const { candidateId, electionId } = req.body;
 
@@ -1161,7 +1243,7 @@ app.get(
   }
 );
 
-app.get("/api/admin/audit/verify", authenticateToken, adminOnly, async (req, res) => {
+app.get("/api/admin/audit/verify", authenticateToken, adminOnly, requireRecentMfa, async (req, res) => {
   try {
     await ensureAuditChain();
     res.json(await verifyAuditChain());
@@ -1171,7 +1253,7 @@ app.get("/api/admin/audit/verify", authenticateToken, adminOnly, async (req, res
   }
 });
 
-app.get("/api/admin/results/:electionId", authenticateToken, adminOnly, async (req, res) => {
+app.get("/api/admin/results/:electionId", authenticateToken, adminOnly, requireRecentMfa, async (req, res) => {
   try {
     const electionId = Number(req.params.electionId);
     if (!Number.isInteger(electionId) || electionId <= 0) return res.status(400).json({ message: "Invalid election ID" });
@@ -1216,6 +1298,17 @@ app.get("/api/results/latest", authenticateToken, async (req, res) => {
     console.error("Public results error:", error);
     res.status(500).json({ message: "Failed to retrieve secure results" });
   }
+});
+
+app.use((req, res) => {
+  res.status(404).json({ message: "Resource not found" });
+});
+
+app.use((error, req, res, next) => {
+  if (res.headersSent) return next(error);
+  if (error.type === "entity.too.large") return res.status(413).json({ message: "Request body too large" });
+  console.error("Unhandled API error:", error.message || error);
+  res.status(500).json({ message: "Request could not be completed" });
 });
 
 const PORT = Number(process.env.PORT || 5002);

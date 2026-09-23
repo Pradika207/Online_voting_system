@@ -21,3 +21,9 @@ Set `BALLOT_ENCRYPTION_KEY` in production to a base64-encoded 32-byte secret sup
 Counting is backend-only. Each ballot is verified for its SHA-256 record hash, AES-GCM authentication, election binding, and candidate validity before it contributes to results. Invalid ballots are excluded and generate a generic `BALLOT_INTEGRITY_FAILURE` audit event without recording a candidate choice.
 
 Audit events use a SHA-256 chain over canonical event data and the previous event hash. Administrators can verify the chain through the protected `/api/admin/audit/verify` endpoint and generate protected election results through `/api/admin/results/:electionId`.
+
+## Authentication and API Security
+
+JWT access sessions expire after 15 minutes and can be revoked through `/api/logout`. Browser state-changing requests with an Origin header must come from the configured local frontend origins; bearer authorization headers are required, so cross-site cookies cannot authorize actions. Express Helmet, request-size limits, API rate limits, sensitive-endpoint throttles, parameterized SQL, React escaped rendering, generic errors, and progressive login lockouts are enabled.
+
+Security configuration variables include `JWT_SECRET`, `REQUEST_BODY_LIMIT`, `LOGIN_RATE_MAX`, `API_RATE_MAX`, `SENSITIVE_RATE_MAX`, `ACCOUNT_FAILURE_LIMIT`, `ACCOUNT_LOCK_MS`, and `REQUIRE_ADMIN_MFA`. Set `REQUIRE_ADMIN_MFA=true` in production to require a recent WebAuthn MFA proof for admin mutations, password changes, audit verification, dashboards, and result generation. Application-level throttling is not a substitute for infrastructure-level DDoS protection.

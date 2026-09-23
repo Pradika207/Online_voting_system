@@ -4,9 +4,19 @@ import { Link, useNavigate } from "react-router-dom";
 function Navbar() {
   const navigate = useNavigate();
 
-  function logout() {
+  async function logout() {
+    const token = localStorage.getItem("token");
+    if (token) {
+      await fetch("http://localhost:5002/api/logout", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      }).catch(() => {});
+    }
     localStorage.removeItem("token");
     localStorage.removeItem("role");
+    localStorage.removeItem("biometricToken");
+    localStorage.removeItem("votingToken");
+    localStorage.removeItem("votingElectionId");
     navigate("/login");
   }
 
