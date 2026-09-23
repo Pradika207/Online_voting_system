@@ -9,3 +9,9 @@ Follow the instructions in the root README to install and run.
 The voting review step uses WebAuthn platform authentication. A supported browser/device may prompt for fingerprint, face recognition, or secure device PIN. Biometric data and private keys remain on the device; the server stores only the WebAuthn credential public key and signature counter.
 
 For local development, the defaults are `localhost` and `http://localhost:5173`. For deployment, set `WEBAUTHN_RP_ID` to the deployment hostname and `WEBAUTHN_ORIGIN` to the exact HTTPS frontend origin. HTTPS is required outside localhost.
+
+## Anonymous Encrypted Ballots
+
+Votes are stored in the `ballots` table as AES-256-GCM ciphertext with a random 96-bit IV, authentication tag, election-bound associated data, and SHA-256 integrity hash. The ballot record contains no voter ID or candidate ID. Voter eligibility and one-person-one-vote state are stored separately in `election_eligibility`.
+
+Set `BALLOT_ENCRYPTION_KEY` in production to a base64-encoded 32-byte secret supplied by a secret manager. The key is never sent to the frontend or committed to Git. Local development creates a `.ballot-key` file, which is ignored by Git. Rotating this key requires a controlled re-encryption migration before old ballots can be counted.

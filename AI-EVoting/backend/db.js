@@ -68,13 +68,15 @@ if (useSqlite) {
       FOREIGN KEY(election_id) REFERENCES elections(id)
     );
 
-    CREATE TABLE IF NOT EXISTS votes (
+    CREATE TABLE IF NOT EXISTS ballots (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER,
-      candidate_id INTEGER,
+      election_id INTEGER NOT NULL,
+      iv TEXT NOT NULL,
+      ciphertext TEXT NOT NULL,
+      auth_tag TEXT NOT NULL,
+      ballot_hash TEXT UNIQUE NOT NULL,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY(user_id) REFERENCES users(id),
-      FOREIGN KEY(candidate_id) REFERENCES candidates(id)
+      FOREIGN KEY(election_id) REFERENCES elections(id)
     );
 
     CREATE TABLE IF NOT EXISTS fraud_alerts (
@@ -191,22 +193,30 @@ if (useSqlite) {
                   return
                 }
 
-                db.all('PRAGMA table_info(votes)', [], (votePragmaErr, voteColumns) => {
-                  if (votePragmaErr) {
-                    console.error('SQLite votes migration check failed:', votePragmaErr)
+                db.run("DROP INDEX IF EXISTS votes_one_person_one_vote", (indexErr) => {
+                  if (indexErr) {
+                    console.error('SQLite legacy vote index migration failed:', indexErr)
                     return
                   }
 
-                  const hasElectionId = (voteColumns || []).some((column) => column.name === 'election_id')
-                  const addElectionId = hasElectionId ? Promise.resolve() : new Promise((resolve, reject) => {
-                    db.run("ALTER TABLE votes ADD COLUMN election_id INTEGER", (addElectionErr) => addElectionErr ? reject(addElectionErr) : resolve())
-                  })
+                  db.run("DROP TABLE IF EXISTS votes", (legacyVotesErr) => {
+                    if (legacyVotesErr) {
+                      console.error('SQLite legacy vote migration failed:', legacyVotesErr)
+                      return
+                    }
 
-                  addElectionId.then(() => new Promise((resolve, reject) => {
-                    db.run("CREATE UNIQUE INDEX IF NOT EXISTS votes_one_person_one_vote ON votes(user_id, election_id)", (indexErr) => indexErr ? reject(indexErr) : resolve())
-                  })).then(() => new Promise((resolve, reject) => {
-                    db.run("INSERT OR IGNORE INTO election_eligibility (voter_id, election_id) SELECT u.id, e.id FROM users u CROSS JOIN elections e WHERE u.role = 'voter'", (seedEligibilityErr) => seedEligibilityErr ? reject(seedEligibilityErr) : resolve())
-                  })).then(() => {
+                    db.run("CREATE TABLE IF NOT EXISTS ballots (id INTEGER PRIMARY KEY AUTOINCREMENT, election_id INTEGER NOT NULL, iv TEXT NOT NULL, ciphertext TEXT NOT NULL, auth_tag TEXT NOT NULL, ballot_hash TEXT UNIQUE NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(election_id) REFERENCES elections(id))", (ballotErr) => {
+                      if (ballotErr) {
+                        console.error('SQLite ballot table migration failed:', ballotErr)
+                        return
+                      }
+
+                      db.run("INSERT OR IGNORE INTO election_eligibility (voter_id, election_id) SELECT u.id, e.id FROM users u CROSS JOIN elections e WHERE u.role = 'voter'", (seedEligibilityErr) => {
+                        if (seedEligibilityErr) {
+                          console.error('SQLite eligibility seed failed:', seedEligibilityErr)
+                          return
+                        }
+
                     db.all('PRAGMA table_info(candidates)', [], (candidatePragmaErr, candidateColumns) => {
                       if (candidatePragmaErr) {
                         console.error('SQLite candidates migration check failed:', candidatePragmaErr)
@@ -237,8 +247,8 @@ if (useSqlite) {
 
                       runCandidateMigration()
                     })
-                  }).catch((migrationErr) => {
-                    console.error('SQLite vote migration failed:', migrationErr)
+                      })
+                    })
                   })
                 })
               })

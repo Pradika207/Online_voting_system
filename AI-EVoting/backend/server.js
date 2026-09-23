@@ -6,6 +6,8 @@ const rateLimit = require("express-rate-limit");
 const { body, validationResult } = require("express-validator");
 const helmet = require("helmet");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 require("dotenv").config();
 
 const pool = require("./db");
@@ -44,6 +46,84 @@ function hashVotingToken(token) {
 
 function createVotingToken() {
   return crypto.randomBytes(32).toString("base64url");
+}
+
+function loadBallotEncryptionKey() {
+  const configuredKey = process.env.BALLOT_ENCRYPTION_KEY;
+  if (configuredKey) {
+    const key = Buffer.from(configuredKey, "base64");
+    if (key.length !== 32) throw new Error("BALLOT_ENCRYPTION_KEY must be a base64-encoded 32-byte key");
+    return key;
+  }
+
+  if (process.env.NODE_ENV === "production") {
+    throw new Error("BALLOT_ENCRYPTION_KEY is required in production");
+  }
+
+  const keyFile = process.env.BALLOT_KEY_FILE || path.resolve(__dirname, ".ballot-key");
+  try {
+    const existingKey = Buffer.from(fs.readFileSync(keyFile, "utf8").trim(), "base64");
+    if (existingKey.length === 32) return existingKey;
+  } catch (error) {
+    // Generate a local development key below.
+  }
+
+  const generatedKey = crypto.randomBytes(32);
+  fs.writeFileSync(keyFile, generatedKey.toString("base64"), { mode: 0o600 });
+  return generatedKey;
+}
+
+const ballotEncryptionKey = loadBallotEncryptionKey();
+
+function encryptBallot(electionId, candidateId) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", ballotEncryptionKey, iv);
+  const associatedData = Buffer.from(`election:${electionId}`);
+  cipher.setAAD(associatedData);
+  const plaintext = Buffer.from(JSON.stringify({ version: 1, candidateId }));
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+  const ivText = iv.toString("base64");
+  const ciphertextText = ciphertext.toString("base64");
+  const authTagText = authTag.toString("base64");
+  const ballotHash = crypto.createHash("sha256")
+    .update(`${electionId}.${ivText}.${ciphertextText}.${authTagText}`)
+    .digest("hex");
+
+  return { electionId, iv: ivText, ciphertext: ciphertextText, authTag: authTagText, ballotHash };
+}
+
+function decryptBallot(ballot) {
+  const expectedHash = crypto.createHash("sha256")
+    .update(`${ballot.election_id}.${ballot.iv}.${ballot.ciphertext}.${ballot.auth_tag}`)
+    .digest("hex");
+  if (expectedHash !== ballot.ballot_hash) throw new Error("Ballot integrity verification failed");
+
+  const decipher = crypto.createDecipheriv("aes-256-gcm", ballotEncryptionKey, Buffer.from(ballot.iv, "base64"));
+  decipher.setAAD(Buffer.from(`election:${ballot.election_id}`));
+  decipher.setAuthTag(Buffer.from(ballot.auth_tag, "base64"));
+  const plaintext = Buffer.concat([
+    decipher.update(Buffer.from(ballot.ciphertext, "base64")),
+    decipher.final(),
+  ]);
+  const payload = JSON.parse(plaintext.toString("utf8"));
+  if (payload.version !== 1 || !Number.isInteger(Number(payload.candidateId))) throw new Error("Invalid ballot payload");
+  return payload;
+}
+
+async function countVerifiedBallots(electionId) {
+  const ballots = electionId
+    ? await pool.query(
+      "SELECT id, election_id, iv, ciphertext, auth_tag, ballot_hash FROM ballots WHERE election_id = $1 ORDER BY id",
+      [electionId]
+    )
+    : await pool.query("SELECT id, election_id, iv, ciphertext, auth_tag, ballot_hash FROM ballots ORDER BY id");
+  const counts = new Map();
+  for (const ballot of ballots.rows) {
+    const payload = decryptBallot(ballot);
+    counts.set(Number(payload.candidateId), (counts.get(Number(payload.candidateId)) || 0) + 1);
+  }
+  return { total: ballots.rows.length, counts };
 }
 
 function normalizePhone(phone) {
@@ -610,7 +690,7 @@ app.get(
 
       // Total votes
       const votes = await pool.query(
-        `SELECT COUNT(*) AS count FROM votes`
+        `SELECT COUNT(*) AS count FROM ballots`
       );
 
       // Total candidates
@@ -619,18 +699,12 @@ app.get(
       );
 
       // Results
-      const results = await pool.query(
-        `SELECT 
-          c.id,
-          c.name,
-          c.party,
-          COUNT(v.id) AS vote_count
-         FROM candidates c
-         LEFT JOIN votes v
-         ON c.id = v.candidate_id
-         GROUP BY c.id
-         ORDER BY vote_count DESC`
-      );
+      const verifiedBallots = await countVerifiedBallots();
+      const results = await pool.query(`SELECT id, name, party FROM candidates ORDER BY id`);
+      const resultRows = results.rows.map((candidate) => ({
+        ...candidate,
+        vote_count: verifiedBallots.counts.get(Number(candidate.id)) || 0,
+      })).sort((left, right) => Number(right.vote_count) - Number(left.vote_count));
 
       res.json({
         totalVoters: Number(voters.rows[0].count),
@@ -638,7 +712,7 @@ app.get(
         totalVotes: Number(votes.rows[0].count),
         totalCandidates: Number(candidates.rows[0].count),
         activeElection: activeElection.rows[0] || null,
-        results: results.rows
+        results: resultRows
       });
 
     } catch (error) {
@@ -764,9 +838,12 @@ app.post("/api/vote", authenticateToken, async (req, res) => {
     // Audit: vote attempt
     await logAudit(userId, "VOTE_ATTEMPT");
 
-    // Check blockchain and submit on-chain
+    const encryptedBallot = encryptBallot(electionNumber, Number(candidateId));
+
+    // The legacy blockchain contract stores voter/candidate pairs, so it is not used
+    // for anonymous ballots. Encrypted ballots are the authoritative record.
     try {
-      const blockchainAvailable = !!(votingContract && process.env.CONTRACT_ADDRESS && process.env.CONTRACT_ADDRESS !== '');
+      const blockchainAvailable = false;
 
       if (!blockchainAvailable) {
         console.log('Blockchain not configured; using local demo voting mode for user', userId);
@@ -789,14 +866,15 @@ app.post("/api/vote", authenticateToken, async (req, res) => {
           }
 
           await client.query(
-            `INSERT INTO votes (user_id, candidate_id, election_id) VALUES ($1, $2, $3)`,
-            [userId, candidateId, electionNumber]
+            `INSERT INTO ballots (election_id, iv, ciphertext, auth_tag, ballot_hash) VALUES ($1, $2, $3, $4, $5)`,
+            [encryptedBallot.electionId, encryptedBallot.iv, encryptedBallot.ciphertext, encryptedBallot.authTag, encryptedBallot.ballotHash]
           );
 
-          await client.query(
+          const markedEligibility = await client.query(
             `UPDATE election_eligibility SET voted_at = CURRENT_TIMESTAMP WHERE voter_id = $1 AND election_id = $2 AND eligible = 1 AND voted_at IS NULL`,
             [userId, electionNumber]
           );
+          if (!markedEligibility.rowCount) throw new Error('Eligibility was already consumed');
 
           await client.query(`UPDATE users SET has_voted = TRUE WHERE id = $1`, [userId]);
 
@@ -858,14 +936,15 @@ app.post("/api/vote", authenticateToken, async (req, res) => {
         }
 
         await client.query(
-          `INSERT INTO votes (user_id, candidate_id, election_id) VALUES ($1, $2, $3)`,
-          [userId, candidateId, electionNumber]
+          `INSERT INTO ballots (election_id, iv, ciphertext, auth_tag, ballot_hash) VALUES ($1, $2, $3, $4, $5)`,
+          [encryptedBallot.electionId, encryptedBallot.iv, encryptedBallot.ciphertext, encryptedBallot.authTag, encryptedBallot.ballotHash]
         );
 
-        await client.query(
+        const markedEligibility = await client.query(
           `UPDATE election_eligibility SET voted_at = CURRENT_TIMESTAMP WHERE voter_id = $1 AND election_id = $2 AND eligible = 1 AND voted_at IS NULL`,
           [userId, electionNumber]
         );
+        if (!markedEligibility.rowCount) throw new Error("Eligibility was already consumed");
 
         await client.query(`UPDATE users SET has_voted = TRUE WHERE id = $1`, [userId]);
 

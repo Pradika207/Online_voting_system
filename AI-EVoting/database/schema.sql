@@ -39,11 +39,13 @@ CREATE TABLE IF NOT EXISTS elections (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS votes (
+CREATE TABLE IF NOT EXISTS ballots (
     id SERIAL PRIMARY KEY,
-    user_id INT REFERENCES users(id),
-    candidate_id INT REFERENCES candidates(id),
     election_id INT REFERENCES elections(id),
+    iv TEXT NOT NULL,
+    ciphertext TEXT NOT NULL,
+    auth_tag TEXT NOT NULL,
+    ballot_hash TEXT UNIQUE NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -64,8 +66,6 @@ CREATE TABLE IF NOT EXISTS voting_tokens (
     used_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS votes_one_person_one_vote ON votes(user_id, election_id);
 
 CREATE TABLE IF NOT EXISTS fraud_alerts (
     id SERIAL PRIMARY KEY,

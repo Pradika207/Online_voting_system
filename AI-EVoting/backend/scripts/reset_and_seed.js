@@ -25,13 +25,43 @@ CREATE TABLE candidates (
   party TEXT
 );
 
-CREATE TABLE votes (
+CREATE TABLE elections (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER,
-  candidate_id INTEGER,
+  name TEXT NOT NULL,
+  description TEXT,
+  start_date DATETIME,
+  end_date DATETIME,
+  status TEXT DEFAULT 'upcoming',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE election_eligibility (
+  voter_id INTEGER NOT NULL,
+  election_id INTEGER NOT NULL,
+  eligible INTEGER DEFAULT 1,
+  voted_at DATETIME,
+  PRIMARY KEY (voter_id, election_id)
+);
+
+CREATE TABLE voting_tokens (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  token_hash TEXT UNIQUE NOT NULL,
+  voter_id INTEGER NOT NULL,
+  election_id INTEGER NOT NULL,
+  expires_at DATETIME NOT NULL,
+  used_at DATETIME,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE ballots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  election_id INTEGER NOT NULL,
+  iv TEXT NOT NULL,
+  ciphertext TEXT NOT NULL,
+  auth_tag TEXT NOT NULL,
+  ballot_hash TEXT UNIQUE NOT NULL,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY(user_id) REFERENCES users(id),
-  FOREIGN KEY(candidate_id) REFERENCES candidates(id)
+  FOREIGN KEY(election_id) REFERENCES elections(id)
 );
 
 CREATE TABLE fraud_alerts (
