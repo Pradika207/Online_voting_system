@@ -1,0 +1,14 @@
+node_modules/
+dist/
+build/
+.env
+.env.*
+**/.env
+**/.env.*
+/.DS_Store
+frontend/node_modules/
+backend/node_modules/
+**/*.sqlite
+**/*.sqlite-journal
+**/blockchain/artifacts/
+**/blockchain/cache/
