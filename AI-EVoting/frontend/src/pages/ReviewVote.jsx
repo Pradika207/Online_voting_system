@@ -102,6 +102,11 @@ function ReviewVote() {
             return;
         }
 
+        if (localStorage.getItem("voteSubmitted") === "true") {
+            navigate("/confirmation");
+            return;
+        }
+
         const token = localStorage.getItem("token");
         const votingToken = localStorage.getItem("votingToken");
         const votingElectionId = localStorage.getItem("votingElectionId");
@@ -120,6 +125,11 @@ function ReviewVote() {
         localStorage.setItem("lastTx", data.transactionHash || "");
 
         if (response.ok) {
+            localStorage.setItem("voteSubmitted", "true");
+            localStorage.setItem("lastReceiptReference", data.receiptReference || "");
+            localStorage.setItem("lastVoteElectionName", election?.name || "");
+            localStorage.setItem("lastVoteSubmittedAt", new Date().toISOString());
+            localStorage.setItem("lastVoteStatus", "accepted");
             localStorage.removeItem("pendingVote");
             localStorage.removeItem("biometricToken");
             localStorage.removeItem("votingToken");

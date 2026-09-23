@@ -49,6 +49,31 @@ function createVotingToken() {
   return crypto.randomBytes(32).toString("base64url");
 }
 
+function validateElectionWindow(startDate, endDate) {
+  if (!startDate || !endDate) return { valid: true, start: null, end: null };
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start >= end) {
+    return { valid: false };
+  }
+  return { valid: true, start, end };
+}
+
+function receiptReference() {
+  return crypto.randomBytes(24).toString("base64url");
+}
+
+async function ensureNotaForElection(electionId) {
+  const existing = await pool.query("SELECT id FROM candidates WHERE election_id = $1 AND is_nota = 1", [electionId]);
+  if (existing.rows.length) return existing.rows[0].id;
+  const inserted = await pool.query(
+    `INSERT INTO candidates (name, party, manifesto, election_id, active, is_nota)
+     VALUES ('None of the Above (NOTA)', 'NOTA', 'None of the listed candidates', $1, 1, 1) RETURNING id`,
+    [electionId]
+  );
+  return inserted.rows[0].id;
+}
+
 function loadBallotEncryptionKey() {
   const configuredKey = process.env.BALLOT_ENCRYPTION_KEY;
   if (configuredKey) {
@@ -451,6 +476,7 @@ app.get("/api/elections/active", authenticateToken, async (req, res) => {
        LIMIT 1`
     );
     if (result.rows.length === 0) return res.status(404).json({ message: "No active election" });
+    await ensureNotaForElection(result.rows[0].id);
     res.json({ election: result.rows[0] });
   } catch (error) {
     console.error(error);
@@ -460,9 +486,11 @@ app.get("/api/elections/active", authenticateToken, async (req, res) => {
 
 app.get("/api/candidates", async (req, res) => {
   try {
-    const result = await pool.query(
-      "SELECT id, name, party, photo_url, manifesto, election_id FROM candidates ORDER BY id"
-    );
+    const electionId = req.query.electionId ? Number(req.query.electionId) : null;
+    if (req.query.electionId && (!Number.isInteger(electionId) || electionId <= 0)) return res.status(400).json({ message: "Invalid election ID" });
+    const result = electionId
+      ? await pool.query("SELECT id, name, party, photo_url, manifesto, election_id, active, is_nota FROM candidates WHERE active = 1 AND (election_id = $1 OR election_id IS NULL) ORDER BY is_nota, id", [electionId])
+      : await pool.query("SELECT id, name, party, photo_url, manifesto, election_id, active, is_nota FROM candidates WHERE active = 1 ORDER BY id");
 
     res.json(result.rows);
   } catch (error) {
@@ -694,12 +722,16 @@ app.get("/api/admin/voters/:id", authenticateToken, adminOnly, async (req, res) 
 app.post("/api/admin/candidates", authenticateToken, adminOnly, requireRecentMfa, async (req, res) => {
   try {
     const { name, party, photoUrl, manifesto, electionId } = req.body;
-    if (!String(name || "").trim()) return res.status(400).json({ message: "Candidate name is required" });
+    const electionNumber = Number(electionId);
+    if (!String(name || "").trim() || !Number.isInteger(electionNumber) || electionNumber <= 0) return res.status(400).json({ message: "Candidate name and election are required" });
+    const election = await pool.query("SELECT id, status FROM elections WHERE id = $1", [electionNumber]);
+    if (!election.rows.length) return res.status(400).json({ message: "Election not found" });
+    if (election.rows[0].status !== "upcoming") return res.status(409).json({ message: "Candidates cannot be added after an election starts" });
 
     const result = await pool.query(
-      `INSERT INTO candidates (name, party, photo_url, manifesto, election_id)
-       VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-      [String(name).trim(), party || null, photoUrl || null, manifesto || null, electionId || null]
+      `INSERT INTO candidates (name, party, photo_url, manifesto, election_id, active, is_nota)
+       VALUES ($1, $2, $3, $4, $5, 1, 0) RETURNING id`,
+      [String(name).trim(), party || null, photoUrl || null, manifesto || null, electionNumber]
     );
     const candidate = await pool.query("SELECT id, name, party, photo_url, manifesto, election_id FROM candidates WHERE id = $1", [result.rows[0].id]);
     await logAudit(req.user.userId, "CANDIDATE_CREATED");
@@ -712,13 +744,17 @@ app.post("/api/admin/candidates", authenticateToken, adminOnly, requireRecentMfa
 
 app.put("/api/admin/candidates/:id", authenticateToken, adminOnly, requireRecentMfa, async (req, res) => {
   try {
-    const { name, party, photoUrl, manifesto, electionId } = req.body;
+    const { name, party, photoUrl, manifesto } = req.body;
     if (!String(name || "").trim()) return res.status(400).json({ message: "Candidate name is required" });
+    const existing = await pool.query("SELECT id, election_id, is_nota FROM candidates WHERE id = $1", [req.params.id]);
+    if (!existing.rows.length) return res.status(404).json({ message: "Candidate not found" });
+    if (existing.rows[0].is_nota) return res.status(409).json({ message: "NOTA cannot be edited" });
+    const election = await pool.query("SELECT status FROM elections WHERE id = $1", [existing.rows[0].election_id]);
+    if (election.rows[0]?.status !== "upcoming") return res.status(409).json({ message: "Candidates cannot be modified after an election starts" });
 
     const result = await pool.query(
-      `UPDATE candidates SET name = $1, party = $2, photo_url = $3, manifesto = $4, election_id = $5
-       WHERE id = $6`,
-      [String(name).trim(), party || null, photoUrl || null, manifesto || null, electionId || null, req.params.id]
+      `UPDATE candidates SET name = $1, party = $2, photo_url = $3, manifesto = $4 WHERE id = $5`,
+      [String(name).trim(), party || null, photoUrl || null, manifesto || null, req.params.id]
     );
     if (!result.rowCount) return res.status(404).json({ message: "Candidate not found" });
     const candidate = await pool.query("SELECT id, name, party, photo_url, manifesto, election_id FROM candidates WHERE id = $1", [req.params.id]);
@@ -732,6 +768,11 @@ app.put("/api/admin/candidates/:id", authenticateToken, adminOnly, requireRecent
 
 app.delete("/api/admin/candidates/:id", authenticateToken, adminOnly, requireRecentMfa, async (req, res) => {
   try {
+    const candidate = await pool.query("SELECT election_id, is_nota FROM candidates WHERE id = $1", [req.params.id]);
+    if (!candidate.rows.length) return res.status(404).json({ message: "Candidate not found" });
+    if (candidate.rows[0].is_nota) return res.status(409).json({ message: "NOTA cannot be deleted" });
+    const election = await pool.query("SELECT status FROM elections WHERE id = $1", [candidate.rows[0].election_id]);
+    if (election.rows[0]?.status !== "upcoming") return res.status(409).json({ message: "Use deactivation after an election starts" });
     const result = await pool.query("DELETE FROM candidates WHERE id = $1", [req.params.id]);
     if (!result.rowCount) return res.status(404).json({ message: "Candidate not found" });
     await logAudit(req.user.userId, "CANDIDATE_DELETED");
@@ -742,10 +783,28 @@ app.delete("/api/admin/candidates/:id", authenticateToken, adminOnly, requireRec
   }
 });
 
+app.patch("/api/admin/candidates/:id/status", authenticateToken, adminOnly, requireRecentMfa, async (req, res) => {
+  try {
+    const active = req.body.active === true;
+    const candidate = await pool.query("SELECT election_id, is_nota FROM candidates WHERE id = $1", [req.params.id]);
+    if (!candidate.rows.length) return res.status(404).json({ message: "Candidate not found" });
+    if (candidate.rows[0].is_nota && !active) return res.status(409).json({ message: "NOTA cannot be deactivated" });
+    const election = await pool.query("SELECT status FROM elections WHERE id = $1", [candidate.rows[0].election_id]);
+    if (election.rows[0]?.status !== "upcoming") return res.status(409).json({ message: "Candidate status cannot change after an election starts" });
+    await pool.query("UPDATE candidates SET active = $1 WHERE id = $2", [active ? 1 : 0, req.params.id]);
+    await logAudit(req.user.userId, active ? "CANDIDATE_ACTIVATED" : "CANDIDATE_DEACTIVATED");
+    res.json({ message: "Candidate status updated" });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Failed to update candidate status" });
+  }
+});
+
 // Admin: election management
 app.get("/api/admin/elections", authenticateToken, adminOnly, async (req, res) => {
   try {
     const result = await pool.query("SELECT id, name, description, start_date, end_date, status, created_at FROM elections ORDER BY id DESC");
+    for (const election of result.rows) await ensureNotaForElection(election.id);
     res.json({ elections: result.rows });
   } catch (error) {
     console.error(error);
@@ -756,14 +815,19 @@ app.get("/api/admin/elections", authenticateToken, adminOnly, async (req, res) =
 app.post("/api/admin/elections", authenticateToken, adminOnly, requireRecentMfa, async (req, res) => {
   try {
     const { name, description, startDate, endDate, status } = req.body;
-    if (!String(name || "").trim()) return res.status(400).json({ message: "Election name is required" });
+    const requestedStatus = String(status || "upcoming").toLowerCase();
+    const dateWindow = validateElectionWindow(startDate, endDate);
+    if (!String(name || "").trim() || !dateWindow.valid) return res.status(400).json({ message: "Election name and valid start/end dates are required" });
+    if (!["upcoming", "active", "completed"].includes(requestedStatus)) return res.status(400).json({ message: "Invalid election status" });
+    if (requestedStatus === "active" && dateWindow.start && dateWindow.start.getTime() > Date.now()) return res.status(400).json({ message: "Election cannot start before its start time" });
 
     const result = await pool.query(
       `INSERT INTO elections (name, description, start_date, end_date, status)
        VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-      [String(name).trim(), description || null, startDate || null, endDate || null, status || "upcoming"]
+      [String(name).trim(), description || null, startDate || null, endDate || null, requestedStatus]
     );
     const election = await pool.query("SELECT id, name, description, start_date, end_date, status, created_at FROM elections WHERE id = $1", [result.rows[0].id]);
+    await ensureNotaForElection(result.rows[0].id);
     await pool.query(
       "INSERT INTO election_eligibility (voter_id, election_id) SELECT id, $1 FROM users WHERE role = 'voter' ON CONFLICT DO NOTHING",
       [result.rows[0].id]
@@ -776,11 +840,38 @@ app.post("/api/admin/elections", authenticateToken, adminOnly, requireRecentMfa,
   }
 });
 
+app.put("/api/admin/elections/:id", authenticateToken, adminOnly, requireRecentMfa, async (req, res) => {
+  try {
+    const { name, description, startDate, endDate } = req.body;
+    const dateWindow = validateElectionWindow(startDate, endDate);
+    if (!String(name || "").trim() || !dateWindow.valid) return res.status(400).json({ message: "Election name and valid start/end dates are required" });
+    const current = await pool.query("SELECT status FROM elections WHERE id = $1", [req.params.id]);
+    if (!current.rows.length) return res.status(404).json({ message: "Election not found" });
+    if (current.rows[0].status !== "upcoming") return res.status(409).json({ message: "Started or completed elections cannot be edited" });
+    const updated = await pool.query(
+      "UPDATE elections SET name = $1, description = $2, start_date = $3, end_date = $4 WHERE id = $5",
+      [String(name).trim(), description || null, startDate || null, endDate || null, req.params.id]
+    );
+    if (!updated.rowCount) return res.status(404).json({ message: "Election not found" });
+    await logAudit(req.user.userId, "ELECTION_UPDATED");
+    res.json({ message: "Election updated" });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Failed to update election" });
+  }
+});
+
 app.patch("/api/admin/elections/:id/status", authenticateToken, adminOnly, requireRecentMfa, async (req, res) => {
   try {
     const allowedStatuses = ["upcoming", "active", "completed"];
     const status = String(req.body.status || "").toLowerCase();
     if (!allowedStatuses.includes(status)) return res.status(400).json({ message: "Invalid election status" });
+
+    const current = await pool.query("SELECT status, start_date, end_date FROM elections WHERE id = $1", [req.params.id]);
+    if (!current.rows.length) return res.status(404).json({ message: "Election not found" });
+    const dateWindow = validateElectionWindow(current.rows[0].start_date, current.rows[0].end_date);
+    if (!dateWindow.valid) return res.status(400).json({ message: "Election has invalid dates" });
+    if (status === "active" && dateWindow.start && dateWindow.start.getTime() > Date.now()) return res.status(400).json({ message: "Election cannot start before its start time" });
 
     const result = await pool.query("UPDATE elections SET status = $1 WHERE id = $2", [status, req.params.id]);
     if (!result.rowCount) return res.status(404).json({ message: "Election not found" });
@@ -927,7 +1018,7 @@ app.post("/api/vote", sensitiveLimiter, authenticateToken, async (req, res) => {
     const user = userResult.rows[0];
 
     // Check candidate
-    const candidateResult = await pool.query("SELECT * FROM candidates WHERE id = $1", [candidateId]);
+    const candidateResult = await pool.query("SELECT * FROM candidates WHERE id = $1 AND active = 1", [candidateId]);
 
     if (candidateResult.rows.length === 0) {
       return res.status(404).json({ message: "Candidate not found" });
@@ -1003,6 +1094,8 @@ app.post("/api/vote", sensitiveLimiter, authenticateToken, async (req, res) => {
     await logAudit(userId, "VOTE_ATTEMPT");
 
     const encryptedBallot = encryptBallot(electionNumber, Number(candidateId));
+    const receiptReferenceValue = receiptReference();
+    const receiptHash = crypto.createHash("sha256").update(receiptReferenceValue).digest("hex");
 
     // The legacy blockchain contract stores voter/candidate pairs, so it is not used
     // for anonymous ballots. Encrypted ballots are the authoritative record.
@@ -1040,6 +1133,11 @@ app.post("/api/vote", sensitiveLimiter, authenticateToken, async (req, res) => {
           );
           if (!markedEligibility.rowCount) throw new Error('Eligibility was already consumed');
 
+          await client.query(
+            `INSERT INTO receipts (voter_id, election_id, receipt_hash) VALUES ($1, $2, $3)`,
+            [userId, electionNumber, receiptHash]
+          );
+
           await client.query(`UPDATE users SET has_voted = TRUE WHERE id = $1`, [userId]);
 
           await client.query(
@@ -1060,7 +1158,7 @@ app.post("/api/vote", sensitiveLimiter, authenticateToken, async (req, res) => {
 
         await logAudit(userId, "VOTE_SUCCESS");
 
-        return res.json({ message: 'Vote successfully recorded in demo mode', transactionHash: `demo-${Date.now()}` });
+        return res.json({ message: 'Vote successfully recorded in demo mode', transactionHash: `demo-${Date.now()}`, receiptReference: receiptReferenceValue });
       }
 
       const alreadyVotedOnChain = await votingContract.hasVoted(userId);
@@ -1107,6 +1205,11 @@ app.post("/api/vote", sensitiveLimiter, authenticateToken, async (req, res) => {
         );
         if (!markedEligibility.rowCount) throw new Error("Eligibility was already consumed");
 
+        await client.query(
+          `INSERT INTO receipts (voter_id, election_id, receipt_hash) VALUES ($1, $2, $3)`,
+          [userId, electionNumber, receiptHash]
+        );
+
         await client.query(`UPDATE users SET has_voted = TRUE WHERE id = $1`, [userId]);
 
         await client.query(
@@ -1127,7 +1230,7 @@ app.post("/api/vote", sensitiveLimiter, authenticateToken, async (req, res) => {
 
       await logAudit(userId, "VOTE_SUCCESS");
 
-      res.json({ message: "Vote successfully recorded", transactionHash: receipt.transactionHash || receipt.hash });
+      res.json({ message: "Vote successfully recorded", transactionHash: receipt.transactionHash || receipt.hash, receiptReference: receiptReferenceValue });
     } catch (err) {
       console.error("Blockchain error:", err);
       await logAudit(userId, "VOTE_FAILED_CHAIN");
@@ -1136,6 +1239,31 @@ app.post("/api/vote", sensitiveLimiter, authenticateToken, async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: "Failed to submit vote" });
+  }
+});
+
+app.get("/api/receipts/:reference", authenticateToken, async (req, res) => {
+  try {
+    const reference = String(req.params.reference || "");
+    if (reference.length < 20 || reference.length > 100) return res.status(400).json({ message: "Invalid receipt reference" });
+    const receiptHash = crypto.createHash("sha256").update(reference).digest("hex");
+    const result = await pool.query(
+      `SELECT r.created_at, r.election_id, e.name AS election_name
+       FROM receipts r JOIN elections e ON e.id = r.election_id
+       WHERE r.receipt_hash = $1 AND r.voter_id = $2`,
+      [receiptHash, req.user.userId]
+    );
+    if (!result.rows.length) return res.status(404).json({ message: "Receipt not found" });
+    res.json({
+      receiptReference: reference,
+      electionId: result.rows[0].election_id,
+      electionName: result.rows[0].election_name,
+      status: "accepted",
+      submittedAt: result.rows[0].created_at,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Failed to retrieve receipt" });
   }
 });
 

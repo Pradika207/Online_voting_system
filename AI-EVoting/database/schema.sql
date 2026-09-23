@@ -26,7 +26,10 @@ CREATE TABLE IF NOT EXISTS candidates (
     party VARCHAR(100),
     photo_url TEXT,
     manifesto TEXT,
-    election_id INT
+    election_id INT NOT NULL REFERENCES elections(id),
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    is_nota BOOLEAN NOT NULL DEFAULT FALSE,
+    UNIQUE(election_id, name)
 );
 
 CREATE TABLE IF NOT EXISTS elections (
@@ -66,6 +69,20 @@ CREATE TABLE IF NOT EXISTS voting_tokens (
     used_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS receipts (
+    id SERIAL PRIMARY KEY,
+    voter_id INT NOT NULL REFERENCES users(id),
+    election_id INT NOT NULL REFERENCES elections(id),
+    receipt_hash TEXT UNIQUE NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(voter_id, election_id)
+);
+
+CREATE INDEX IF NOT EXISTS ballots_election_lookup ON ballots(election_id);
+CREATE INDEX IF NOT EXISTS eligibility_voter_election_lookup ON election_eligibility(voter_id, election_id);
+CREATE INDEX IF NOT EXISTS tokens_lookup ON voting_tokens(token_hash, voter_id, election_id);
+CREATE INDEX IF NOT EXISTS receipts_voter_lookup ON receipts(voter_id, election_id);
 
 CREATE TABLE IF NOT EXISTS fraud_alerts (
     id SERIAL PRIMARY KEY,
