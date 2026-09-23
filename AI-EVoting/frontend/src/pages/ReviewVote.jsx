@@ -10,6 +10,8 @@ function ReviewVote() {
     const candidate = JSON.parse(localStorage.getItem("pendingVote") || "null");
     const [biometricEnrolled, setBiometricEnrolled] = useState(false);
     const [biometricBusy, setBiometricBusy] = useState(false);
+    const [election, setElection] = useState(null);
+    const [eligibilityVerified, setEligibilityVerified] = useState(false);
     const [message, setMessage] = useState("");
 
     useEffect(() => {
@@ -18,6 +20,10 @@ function ReviewVote() {
             .then((response) => response.json())
             .then((data) => setBiometricEnrolled(Boolean(data.enrolled)))
             .catch(() => setMessage("Unable to check biometric verification status."));
+        fetch(`${API_BASE_URL}/api/elections/active`, { headers: { Authorization: `Bearer ${token}` } })
+            .then((response) => response.json())
+            .then((data) => setElection(data.election || null))
+            .catch(() => setMessage("There is no active election available."));
     }, []);
 
     const enrollBiometric = async () => {
@@ -63,12 +69,31 @@ function ReviewVote() {
             const data = await verifyResponse.json();
             if (!verifyResponse.ok) throw new Error(data.message || "Biometric verification failed.");
             localStorage.setItem("biometricToken", data.biometricToken);
-            setMessage("Biometric verification successful. You can now cast your vote.");
+            await verifyEligibility(data.biometricToken);
         } catch (error) {
             setMessage(error.message || "Biometric verification was cancelled.");
         } finally {
             setBiometricBusy(false);
         }
+    };
+
+    const verifyEligibility = async (biometricToken = localStorage.getItem("biometricToken")) => {
+        if (!election) throw new Error("No active election is available.");
+        const response = await fetch(`${API_BASE_URL}/api/voter/eligibility`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${localStorage.getItem("token")}`,
+                "X-Biometric-Token": biometricToken,
+            },
+            body: JSON.stringify({ electionId: election.id }),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.message || "Eligibility verification failed.");
+        localStorage.setItem("votingToken", data.votingToken);
+        localStorage.setItem("votingElectionId", String(data.electionId));
+        setEligibilityVerified(true);
+        setMessage("Account, biometric, and election eligibility checks passed.");
     };
 
     const confirmVote = async () => {
@@ -78,16 +103,17 @@ function ReviewVote() {
         }
 
         const token = localStorage.getItem("token");
-        const biometricToken = localStorage.getItem("biometricToken");
+        const votingToken = localStorage.getItem("votingToken");
+        const votingElectionId = localStorage.getItem("votingElectionId");
 
         const response = await fetch(`${API_BASE_URL}/api/vote`, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
                 ...(token ? { Authorization: `Bearer ${token}` } : {}),
-                ...(biometricToken ? { "X-Biometric-Token": biometricToken } : {}),
+                ...(votingToken ? { "X-Voting-Token": votingToken } : {}),
             },
-            body: JSON.stringify({ candidateId: candidate.id })
+            body: JSON.stringify({ candidateId: candidate.id, electionId: Number(votingElectionId) })
         });
 
         const data = await response.json();
@@ -96,6 +122,8 @@ function ReviewVote() {
         if (response.ok) {
             localStorage.removeItem("pendingVote");
             localStorage.removeItem("biometricToken");
+            localStorage.removeItem("votingToken");
+            localStorage.removeItem("votingElectionId");
             navigate("/confirmation");
             return;
         }
@@ -168,7 +196,7 @@ function ReviewVote() {
                 <div style={card}>
                     <h1 style={{ marginTop: 0, marginBottom: 16, fontSize: 36 }}>Review Your Vote</h1>
 
-                    <p style={{ color: "#475569", marginBottom: 12 }}><strong>Election:</strong> Student Council Election 2026</p>
+                    <p style={{ color: "#475569", marginBottom: 12 }}><strong>Election:</strong> {election?.name || "Loading active election..."}</p>
                     <p style={{ color: "#475569", marginBottom: 12 }}><strong>Your selected candidate:</strong></p>
 
                     <div style={{ background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: 20, padding: 24, marginBottom: 24 }}>
@@ -182,18 +210,24 @@ function ReviewVote() {
                     </div>
 
                     <div style={{ background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 18, padding: 20, marginBottom: 24 }}>
-                        <h3 style={{ marginTop: 0 }}>Biometric verification</h3>
+                        <h3 style={{ marginTop: 0 }}>Voter verification</h3>
+                        <ul style={{ lineHeight: 1.8, paddingLeft: 20, color: "#334155" }}>
+                            <li>✓ Account verified</li>
+                            <li>{biometricEnrolled ? "✓" : "○"} Biometric enrolled</li>
+                            <li>{eligibilityVerified ? "✓" : "○"} Eligible for this election</li>
+                            <li>{eligibilityVerified ? "✓ Voting status: Not yet voted" : "○ Voting status: Pending verification"}</li>
+                        </ul>
                         <p style={{ color: "#475569" }}>Your device will ask for fingerprint, face recognition, or another secure screen-lock verification. The private biometric data never leaves your device.</p>
                         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
                             {!biometricEnrolled && <button type="button" onClick={enrollBiometric} disabled={biometricBusy} style={buttonSecondary}>{biometricBusy ? "Waiting for device..." : "Enroll biometric"}</button>}
-                            {biometricEnrolled && <button type="button" onClick={verifyBiometric} disabled={biometricBusy} style={buttonPrimary}>{biometricBusy ? "Waiting for device..." : "Verify biometric"}</button>}
+                            {biometricEnrolled && !eligibilityVerified && <button type="button" onClick={verifyBiometric} disabled={biometricBusy || !election} style={buttonPrimary}>{biometricBusy ? "Checking..." : "Verify & Check Eligibility"}</button>}
                         </div>
                         <p style={{ minHeight: 24, color: message.toLowerCase().includes("failed") || message.toLowerCase().includes("unable") || message.toLowerCase().includes("support") ? "#b91c1c" : "#166534", marginBottom: 0 }}>{message}</p>
                     </div>
 
                     <div>
                         <Link to="/vote" style={buttonSecondary}>Go Back</Link>
-                        <button type="button" onClick={confirmVote} disabled={!localStorage.getItem("biometricToken")} style={{ ...buttonPrimary, opacity: localStorage.getItem("biometricToken") ? 1 : 0.5 }}>Confirm & Cast Vote</button>
+                        <button type="button" onClick={confirmVote} disabled={!eligibilityVerified || !localStorage.getItem("votingToken")} style={{ ...buttonPrimary, opacity: eligibilityVerified ? 1 : 0.5 }}>Confirm & Cast Vote</button>
                     </div>
                 </div>
             </main>

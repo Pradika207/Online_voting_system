@@ -5,6 +5,7 @@ const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
 const { body, validationResult } = require("express-validator");
 const helmet = require("helmet");
+const crypto = require("crypto");
 require("dotenv").config();
 
 const pool = require("./db");
@@ -35,6 +36,14 @@ function takeBiometricChallenge(userId, type, expectedChallenge) {
   const record = biometricChallenges.get(key);
   biometricChallenges.delete(key);
   return record && record.expiresAt > Date.now() && record.challenge === expectedChallenge;
+}
+
+function hashVotingToken(token) {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+function createVotingToken() {
+  return crypto.randomBytes(32).toString("base64url");
 }
 
 function normalizePhone(phone) {
@@ -123,6 +132,11 @@ app.post(
           [name, normalizedEmail, normalizedPhone, hashedPassword]
         );
 
+        await pool.query(
+          "INSERT INTO election_eligibility (voter_id, election_id) SELECT $1, id FROM elections WHERE status IN ('upcoming', 'active') ON CONFLICT DO NOTHING",
+          [insertRes.rows[0].id]
+        );
+
         await logAudit(insertRes.rows[0].id, "REGISTER");
         return res.status(201).json({ message: "Registration successful. Please login to continue." });
       }
@@ -184,6 +198,23 @@ app.post(
 );
 
 // Get candidates
+app.get("/api/elections/active", authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, description, start_date, end_date, status
+       FROM elections
+       WHERE status = 'active'
+       ORDER BY id DESC
+       LIMIT 1`
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: "No active election" });
+    res.json({ election: result.rows[0] });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Failed to retrieve active election" });
+  }
+});
+
 app.get("/api/candidates", async (req, res) => {
   try {
     const result = await pool.query(
@@ -322,6 +353,55 @@ app.post("/api/biometric/authenticate/verify", authenticateToken, async (req, re
   }
 });
 
+app.post("/api/voter/eligibility", authenticateToken, async (req, res) => {
+  try {
+    const electionId = Number(req.body.electionId);
+    const biometricHeader = req.headers["x-biometric-token"];
+    if (!Number.isInteger(electionId) || electionId <= 0) return res.status(400).json({ message: "A valid election is required" });
+    if (!biometricHeader) return res.status(403).json({ message: "Biometric verification is required" });
+
+    let biometricPayload;
+    try {
+      biometricPayload = jwt.verify(biometricHeader, jwtSecret);
+    } catch (error) {
+      return res.status(403).json({ message: "Biometric verification expired or invalid" });
+    }
+
+    const biometricTokenId = biometricPayload.jti || biometricPayload.nonce;
+    if (biometricPayload.purpose !== "vote-biometric" || biometricPayload.userId !== req.user.userId || usedBiometricTokens.has(biometricTokenId)) {
+      return res.status(403).json({ message: "Biometric verification token cannot be reused" });
+    }
+
+    const userResult = await pool.query("SELECT id, verified, role FROM users WHERE id = $1", [req.user.userId]);
+    const electionResult = await pool.query("SELECT id, status, start_date, end_date FROM elections WHERE id = $1", [electionId]);
+    const eligibilityResult = await pool.query("SELECT eligible, voted_at FROM election_eligibility WHERE voter_id = $1 AND election_id = $2", [req.user.userId, electionId]);
+
+    if (userResult.rows.length === 0 || userResult.rows[0].role !== "voter") return res.status(403).json({ message: "Voter account is not eligible" });
+    if (!userResult.rows[0].verified) return res.status(403).json({ message: "Voter account is not verified" });
+    if (electionResult.rows.length === 0) return res.status(404).json({ message: "Election not found" });
+
+    const election = electionResult.rows[0];
+    const now = Date.now();
+    const startsAt = election.start_date ? new Date(election.start_date).getTime() : null;
+    const endsAt = election.end_date ? new Date(election.end_date).getTime() : null;
+    const electionOpen = election.status === "active" && (!startsAt || now >= startsAt) && (!endsAt || now <= endsAt);
+    if (!electionOpen) return res.status(403).json({ message: "Voting is not currently open for this election" });
+    if (eligibilityResult.rows.length === 0 || !eligibilityResult.rows[0].eligible) return res.status(403).json({ message: "Voter is not eligible for this election" });
+    if (eligibilityResult.rows[0].voted_at) return res.status(409).json({ message: "Voter has already voted in this election" });
+
+    const votingToken = createVotingToken();
+    const tokenHash = hashVotingToken(votingToken);
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+    await pool.query("INSERT INTO voting_tokens (token_hash, voter_id, election_id, expires_at) VALUES ($1, $2, $3, $4)", [tokenHash, req.user.userId, electionId, expiresAt]);
+    usedBiometricTokens.add(biometricTokenId);
+    await logAudit(req.user.userId, "VOTER_ELIGIBILITY_VERIFIED");
+    res.json({ eligible: true, electionId, votingToken, expiresAt });
+  } catch (error) {
+    console.error("Eligibility verification error:", error);
+    res.status(500).json({ message: "Unable to verify voter eligibility" });
+  }
+});
+
 // Admin: voter management
 app.get("/api/admin/voters", authenticateToken, adminOnly, async (req, res) => {
   try {
@@ -441,6 +521,10 @@ app.post("/api/admin/elections", authenticateToken, adminOnly, async (req, res) 
       [String(name).trim(), description || null, startDate || null, endDate || null, status || "upcoming"]
     );
     const election = await pool.query("SELECT id, name, description, start_date, end_date, status, created_at FROM elections WHERE id = $1", [result.rows[0].id]);
+    await pool.query(
+      "INSERT INTO election_eligibility (voter_id, election_id) SELECT id, $1 FROM users WHERE role = 'voter' ON CONFLICT DO NOTHING",
+      [result.rows[0].id]
+    );
     await logAudit(req.user.userId, "ELECTION_CREATED");
     res.status(201).json({ election: election.rows[0] });
   } catch (error) {
@@ -571,36 +655,29 @@ app.get(
 // Vote endpoint
 app.post("/api/vote", authenticateToken, async (req, res) => {
   try {
-    const { candidateId } = req.body;
+    const { candidateId, electionId } = req.body;
 
     const userId = req.user && req.user.userId;
-    const biometricHeader = req.headers["x-biometric-token"];
-
-    if (!biometricHeader) {
-      return res.status(403).json({ message: "Biometric verification is required before voting" });
-    }
-
-    let biometricPayload;
-    try {
-      biometricPayload = jwt.verify(biometricHeader, jwtSecret);
-    } catch (error) {
-      return res.status(403).json({ message: "Biometric verification expired or invalid" });
-    }
-
-    const biometricTokenId = biometricPayload.jti || biometricPayload.nonce;
-    if (biometricPayload.purpose !== "vote-biometric" || biometricPayload.userId !== userId || usedBiometricTokens.has(biometricTokenId)) {
-      return res.status(403).json({ message: "Biometric verification token cannot be reused" });
-    }
-
-    usedBiometricTokens.add(biometricTokenId);
+    const votingToken = req.headers["x-voting-token"];
 
     if (!candidateId) {
       return res.status(400).json({ message: "Candidate ID is required" });
     }
 
-    if (!userId) {
+    if (!userId || !Number.isInteger(Number(electionId))) {
       return res.status(401).json({ message: "Invalid user in token" });
     }
+
+    if (!votingToken) return res.status(403).json({ message: "Eligibility verification is required before voting" });
+
+    const electionNumber = Number(electionId);
+    const tokenResult = await pool.query(
+      `SELECT id FROM voting_tokens
+       WHERE token_hash = $1 AND voter_id = $2 AND election_id = $3
+       AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP`,
+      [hashVotingToken(votingToken), userId, electionNumber]
+    );
+    if (tokenResult.rows.length === 0) return res.status(403).json({ message: "Voting token is expired, invalid, or already used" });
 
     // Check user
     const userResult = await pool.query("SELECT * FROM users WHERE id = $1", [userId]);
@@ -611,16 +688,15 @@ app.post("/api/vote", authenticateToken, async (req, res) => {
 
     const user = userResult.rows[0];
 
-    // Prevent double voting
-    if (user.has_voted) {
-      return res.status(400).json({ message: "You have already voted" });
-    }
-
     // Check candidate
     const candidateResult = await pool.query("SELECT * FROM candidates WHERE id = $1", [candidateId]);
 
     if (candidateResult.rows.length === 0) {
       return res.status(404).json({ message: "Candidate not found" });
+    }
+
+    if (candidateResult.rows[0].election_id && Number(candidateResult.rows[0].election_id) !== electionNumber) {
+      return res.status(403).json({ message: "Candidate is not part of this election" });
     }
 
     // Prepare activity features (allow client to supply real telemetry; fallback to defaults)
@@ -700,15 +776,29 @@ app.post("/api/vote", authenticateToken, async (req, res) => {
         try {
           await client.query('BEGIN');
 
+          const consumedToken = await client.query(
+            `UPDATE voting_tokens SET used_at = CURRENT_TIMESTAMP
+             WHERE token_hash = $1 AND voter_id = $2 AND election_id = $3
+             AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP`,
+            [hashVotingToken(votingToken), userId, electionNumber]
+          );
+
+          if (!consumedToken.rowCount) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ message: 'Voting token is expired, invalid, or already used' });
+          }
+
           await client.query(
-            `INSERT INTO votes (user_id, candidate_id) VALUES ($1, $2)`,
-            [userId, candidateId]
+            `INSERT INTO votes (user_id, candidate_id, election_id) VALUES ($1, $2, $3)`,
+            [userId, candidateId, electionNumber]
           );
 
           await client.query(
-            `UPDATE users SET has_voted = TRUE WHERE id = $1`,
-            [userId]
+            `UPDATE election_eligibility SET voted_at = CURRENT_TIMESTAMP WHERE voter_id = $1 AND election_id = $2 AND eligible = 1 AND voted_at IS NULL`,
+            [userId, electionNumber]
           );
+
+          await client.query(`UPDATE users SET has_voted = TRUE WHERE id = $1`, [userId]);
 
           await client.query(
             `INSERT INTO user_activity (user_id, login_attempts, failed_logins, votes_per_minute, ip_changes, device_changes, session_duration)
@@ -755,15 +845,29 @@ app.post("/api/vote", authenticateToken, async (req, res) => {
       try {
         await client.query("BEGIN");
 
+        const consumedToken = await client.query(
+          `UPDATE voting_tokens SET used_at = CURRENT_TIMESTAMP
+           WHERE token_hash = $1 AND voter_id = $2 AND election_id = $3
+           AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP`,
+          [hashVotingToken(votingToken), userId, electionNumber]
+        );
+
+        if (!consumedToken.rowCount) {
+          await client.query("ROLLBACK");
+          return res.status(403).json({ message: "Voting token is expired, invalid, or already used" });
+        }
+
         await client.query(
-          `INSERT INTO votes (user_id, candidate_id) VALUES ($1, $2)`,
-          [userId, candidateId]
+          `INSERT INTO votes (user_id, candidate_id, election_id) VALUES ($1, $2, $3)`,
+          [userId, candidateId, electionNumber]
         );
 
         await client.query(
-          `UPDATE users SET has_voted = TRUE WHERE id = $1`,
-          [userId]
+          `UPDATE election_eligibility SET voted_at = CURRENT_TIMESTAMP WHERE voter_id = $1 AND election_id = $2 AND eligible = 1 AND voted_at IS NULL`,
+          [userId, electionNumber]
         );
+
+        await client.query(`UPDATE users SET has_voted = TRUE WHERE id = $1`, [userId]);
 
         await client.query(
           `INSERT INTO user_activity (user_id, login_attempts, failed_logins, votes_per_minute, ip_changes, device_changes, session_duration)

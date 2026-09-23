@@ -43,8 +43,29 @@ CREATE TABLE IF NOT EXISTS votes (
     id SERIAL PRIMARY KEY,
     user_id INT REFERENCES users(id),
     candidate_id INT REFERENCES candidates(id),
+    election_id INT REFERENCES elections(id),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS election_eligibility (
+    voter_id INT REFERENCES users(id),
+    election_id INT REFERENCES elections(id),
+    eligible BOOLEAN DEFAULT TRUE,
+    voted_at TIMESTAMP,
+    PRIMARY KEY (voter_id, election_id)
+);
+
+CREATE TABLE IF NOT EXISTS voting_tokens (
+    id SERIAL PRIMARY KEY,
+    token_hash TEXT UNIQUE NOT NULL,
+    voter_id INT REFERENCES users(id),
+    election_id INT REFERENCES elections(id),
+    expires_at TIMESTAMP NOT NULL,
+    used_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS votes_one_person_one_vote ON votes(user_id, election_id);
 
 CREATE TABLE IF NOT EXISTS fraud_alerts (
     id SERIAL PRIMARY KEY,

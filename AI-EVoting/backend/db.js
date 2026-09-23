@@ -46,6 +46,28 @@ if (useSqlite) {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS election_eligibility (
+      voter_id INTEGER NOT NULL,
+      election_id INTEGER NOT NULL,
+      eligible INTEGER DEFAULT 1,
+      voted_at DATETIME,
+      PRIMARY KEY (voter_id, election_id),
+      FOREIGN KEY(voter_id) REFERENCES users(id),
+      FOREIGN KEY(election_id) REFERENCES elections(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS voting_tokens (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      token_hash TEXT UNIQUE NOT NULL,
+      voter_id INTEGER NOT NULL,
+      election_id INTEGER NOT NULL,
+      expires_at DATETIME NOT NULL,
+      used_at DATETIME,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(voter_id) REFERENCES users(id),
+      FOREIGN KEY(election_id) REFERENCES elections(id)
+    );
+
     CREATE TABLE IF NOT EXISTS votes (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER,
@@ -157,35 +179,69 @@ if (useSqlite) {
               return
             }
 
-            db.all('PRAGMA table_info(candidates)', [], (candidatePragmaErr, candidateColumns) => {
-              if (candidatePragmaErr) {
-                console.error('SQLite candidates migration check failed:', candidatePragmaErr)
+            db.run("CREATE TABLE IF NOT EXISTS election_eligibility (voter_id INTEGER NOT NULL, election_id INTEGER NOT NULL, eligible INTEGER DEFAULT 1, voted_at DATETIME, PRIMARY KEY (voter_id, election_id))", (eligibilityErr) => {
+              if (eligibilityErr) {
+                console.error('SQLite eligibility migration failed:', eligibilityErr)
                 return
               }
 
-              const candidateColumnNames = new Set((candidateColumns || []).map((col) => col.name))
-              const candidateMigrations = []
-              if (!candidateColumnNames.has('photo_url')) candidateMigrations.push("ALTER TABLE candidates ADD COLUMN photo_url TEXT")
-              if (!candidateColumnNames.has('manifesto')) candidateMigrations.push("ALTER TABLE candidates ADD COLUMN manifesto TEXT")
-              if (!candidateColumnNames.has('election_id')) candidateMigrations.push("ALTER TABLE candidates ADD COLUMN election_id INTEGER")
-
-              const runCandidateMigration = () => {
-                if (candidateMigrations.length === 0) {
-                  console.log('SQLite DB file:', dbFile)
-                  ensureDefaultAdmin()
+              db.run("CREATE TABLE IF NOT EXISTS voting_tokens (id INTEGER PRIMARY KEY AUTOINCREMENT, token_hash TEXT UNIQUE NOT NULL, voter_id INTEGER NOT NULL, election_id INTEGER NOT NULL, expires_at DATETIME NOT NULL, used_at DATETIME, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", (tokenErr) => {
+                if (tokenErr) {
+                  console.error('SQLite voting token migration failed:', tokenErr)
                   return
                 }
 
-                db.run(candidateMigrations.shift(), (candidateMigrationErr) => {
-                  if (candidateMigrationErr) {
-                    console.error('SQLite candidate migration failed:', candidateMigrationErr)
+                db.all('PRAGMA table_info(votes)', [], (votePragmaErr, voteColumns) => {
+                  if (votePragmaErr) {
+                    console.error('SQLite votes migration check failed:', votePragmaErr)
                     return
                   }
-                  runCandidateMigration()
-                })
-              }
 
-              runCandidateMigration()
+                  const hasElectionId = (voteColumns || []).some((column) => column.name === 'election_id')
+                  const addElectionId = hasElectionId ? Promise.resolve() : new Promise((resolve, reject) => {
+                    db.run("ALTER TABLE votes ADD COLUMN election_id INTEGER", (addElectionErr) => addElectionErr ? reject(addElectionErr) : resolve())
+                  })
+
+                  addElectionId.then(() => new Promise((resolve, reject) => {
+                    db.run("CREATE UNIQUE INDEX IF NOT EXISTS votes_one_person_one_vote ON votes(user_id, election_id)", (indexErr) => indexErr ? reject(indexErr) : resolve())
+                  })).then(() => new Promise((resolve, reject) => {
+                    db.run("INSERT OR IGNORE INTO election_eligibility (voter_id, election_id) SELECT u.id, e.id FROM users u CROSS JOIN elections e WHERE u.role = 'voter'", (seedEligibilityErr) => seedEligibilityErr ? reject(seedEligibilityErr) : resolve())
+                  })).then(() => {
+                    db.all('PRAGMA table_info(candidates)', [], (candidatePragmaErr, candidateColumns) => {
+                      if (candidatePragmaErr) {
+                        console.error('SQLite candidates migration check failed:', candidatePragmaErr)
+                        return
+                      }
+
+                      const candidateColumnNames = new Set((candidateColumns || []).map((col) => col.name))
+                      const candidateMigrations = []
+                      if (!candidateColumnNames.has('photo_url')) candidateMigrations.push("ALTER TABLE candidates ADD COLUMN photo_url TEXT")
+                      if (!candidateColumnNames.has('manifesto')) candidateMigrations.push("ALTER TABLE candidates ADD COLUMN manifesto TEXT")
+                      if (!candidateColumnNames.has('election_id')) candidateMigrations.push("ALTER TABLE candidates ADD COLUMN election_id INTEGER")
+
+                      const runCandidateMigration = () => {
+                        if (candidateMigrations.length === 0) {
+                          console.log('SQLite DB file:', dbFile)
+                          ensureDefaultAdmin()
+                          return
+                        }
+
+                        db.run(candidateMigrations.shift(), (candidateMigrationErr) => {
+                          if (candidateMigrationErr) {
+                            console.error('SQLite candidate migration failed:', candidateMigrationErr)
+                            return
+                          }
+                          runCandidateMigration()
+                        })
+                      }
+
+                      runCandidateMigration()
+                    })
+                  }).catch((migrationErr) => {
+                    console.error('SQLite vote migration failed:', migrationErr)
+                  })
+                })
+              })
             })
           })
           return
@@ -204,6 +260,8 @@ if (useSqlite) {
       runMigration()
     })
   })
+
+  let transactionTail = Promise.resolve()
 
   const pool = {
     query: (text, params) => {
@@ -229,9 +287,34 @@ if (useSqlite) {
       })
     },
     connect: async () => {
+      let releaseTransaction
+      const transactionLock = new Promise((resolve) => {
+        releaseTransaction = resolve
+      })
+      const previousTransaction = transactionTail
+      transactionTail = transactionTail.then(() => transactionLock)
+      await previousTransaction
+
+      let transactionStarted = false
+      const releaseIfNeeded = () => {
+        if (transactionStarted) {
+          transactionStarted = false
+          releaseTransaction()
+        }
+      }
+
       return {
-        query: (text, params) => pool.query(text, params),
-        release: () => {},
+        query: async (text, params) => {
+          const normalizedText = text.trim().toUpperCase()
+          if (normalizedText === 'BEGIN' || normalizedText === 'BEGIN IMMEDIATE') transactionStarted = true
+
+          try {
+            return await pool.query(text, params)
+          } finally {
+            if (normalizedText === 'COMMIT' || normalizedText === 'ROLLBACK') releaseIfNeeded()
+          }
+        },
+        release: releaseIfNeeded,
         begin: () => pool.query('BEGIN'),
         commit: () => pool.query('COMMIT'),
         rollback: () => pool.query('ROLLBACK')
