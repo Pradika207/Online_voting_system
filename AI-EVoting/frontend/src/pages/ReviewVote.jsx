@@ -13,28 +13,82 @@ function ReviewVote() {
     const [election, setElection] = useState(null);
     const [eligibilityVerified, setEligibilityVerified] = useState(false);
     const [message, setMessage] = useState("");
+    const [supportsWebAuthn, setSupportsWebAuthn] = useState(false);
+    const isMobileDevice = (() => {
+        if (typeof navigator === "undefined") return false;
+        const userAgent = navigator.userAgent || "";
+        const mobileAgent = /Android|iPhone|iPad|iPod|Mobile|webOS|BlackBerry|IEMobile|Opera Mini/i.test(userAgent);
+        const touchCapable = typeof navigator.maxTouchPoints === "number" && navigator.maxTouchPoints > 0;
+        const narrowViewport = typeof window !== "undefined" && window.innerWidth <= 768;
+        return mobileAgent || (narrowViewport && touchCapable);
+    })();
+
+    const clearSessionAndRedirect = () => {
+        localStorage.removeItem("token");
+        localStorage.removeItem("biometricToken");
+        localStorage.removeItem("votingToken");
+        localStorage.removeItem("votingElectionId");
+        navigate("/login", { replace: true, state: { message: "Your session expired. Please log in again." } });
+    };
+
+    const isSessionError = (message) => /invalid or expired token|access token required|session is invalid/i.test(message || "");
+
+    const getWebAuthnErrorMessage = (error, fallback) => {
+        if (error?.name === "NotAllowedError") return "Verification cancelled.";
+        if (error?.name === "NotSupportedError" || error?.name === "SecurityError") {
+            return "This device or browser cannot complete WebAuthn/passkey verification.";
+        }
+        return error?.message || fallback;
+    };
 
     useEffect(() => {
+        setSupportsWebAuthn(browserSupportsWebAuthn());
         const token = localStorage.getItem("token");
         fetch(`${API_BASE_URL}/api/biometric/status`, { headers: { Authorization: `Bearer ${token}` } })
-            .then((response) => response.json())
+            .then(async (response) => {
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.message || "Unable to check biometric verification status.");
+                return data;
+            })
             .then((data) => setBiometricEnrolled(Boolean(data.enrolled)))
-            .catch(() => setMessage("Unable to check biometric verification status."));
+            .catch((error) => {
+                if (isSessionError(error.message)) {
+                    clearSessionAndRedirect();
+                    return;
+                }
+                setMessage(error.message || "Unable to check biometric verification status.");
+            });
         fetch(`${API_BASE_URL}/api/elections/active`, { headers: { Authorization: `Bearer ${token}` } })
             .then((response) => response.json())
             .then((data) => setElection(data.election || null))
             .catch(() => setMessage("There is no active election available."));
     }, []);
 
+    const ensureWebAuthnSupport = () => {
+        const supported = browserSupportsWebAuthn();
+        setSupportsWebAuthn(supported);
+        if (!supported) {
+            setMessage("This device does not support WebAuthn/passkey authentication. Please use a supported device or complete the required manual verification flow.");
+            return false;
+        }
+        return true;
+    };
+
     const enrollBiometric = async () => {
         setBiometricBusy(true);
         setMessage("");
         try {
-            if (!browserSupportsWebAuthn()) throw new Error("This browser or device does not support biometric verification.");
+            if (!ensureWebAuthnSupport()) return;
             const token = localStorage.getItem("token");
             const optionsResponse = await fetch(`${API_BASE_URL}/api/biometric/register/options`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
             const options = await optionsResponse.json();
-            if (!optionsResponse.ok) throw new Error(options.message || "Unable to start biometric enrollment.");
+            if (!optionsResponse.ok) {
+                if (isSessionError(options.message)) {
+                    clearSessionAndRedirect();
+                    return;
+                }
+                throw new Error(options.message || "Unable to start biometric enrollment.");
+            }
             const credential = await startRegistration({ optionsJSON: options });
             const verifyResponse = await fetch(`${API_BASE_URL}/api/biometric/register/verify`, {
                 method: "POST",
@@ -42,7 +96,13 @@ function ReviewVote() {
                 body: JSON.stringify({ optionsChallenge: options.challenge, response: credential }),
             });
             const data = await verifyResponse.json();
-            if (!verifyResponse.ok) throw new Error(data.message || "Biometric enrollment failed.");
+            if (!verifyResponse.ok) {
+                if (isSessionError(data.message)) {
+                    clearSessionAndRedirect();
+                    return;
+                }
+                throw new Error(data.message || "Biometric enrollment failed.");
+            }
             setBiometricEnrolled(true);
             setMessage("Biometric verification enrolled. Verify again to continue.");
         } catch (error) {
@@ -56,22 +116,41 @@ function ReviewVote() {
         setBiometricBusy(true);
         setMessage("");
         try {
+            if (!ensureWebAuthnSupport()) return;
             const token = localStorage.getItem("token");
             const optionsResponse = await fetch(`${API_BASE_URL}/api/biometric/authenticate/options`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
             const options = await optionsResponse.json();
-            if (!optionsResponse.ok) throw new Error(options.message || "Unable to start biometric verification.");
-            const assertion = await startAuthentication({ optionsJSON: options });
+            if (!optionsResponse.ok) {
+                if (isSessionError(options.message)) {
+                    clearSessionAndRedirect();
+                    return;
+                }
+                throw new Error(options.message || "Unable to start biometric verification.");
+            }
+            let assertion;
+            try {
+                assertion = await startAuthentication({ optionsJSON: options });
+            } catch (error) {
+                setMessage(getWebAuthnErrorMessage(error, "Biometric/device verification failed. Please try again."));
+                return;
+            }
             const verifyResponse = await fetch(`${API_BASE_URL}/api/biometric/authenticate/verify`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
                 body: JSON.stringify({ optionsChallenge: options.challenge, response: assertion }),
             });
             const data = await verifyResponse.json();
-            if (!verifyResponse.ok) throw new Error(data.message || "Biometric verification failed.");
+            if (!verifyResponse.ok) {
+                if (isSessionError(data.message)) {
+                    clearSessionAndRedirect();
+                    return;
+                }
+                throw new Error("Biometric/device verification failed. Please try again.");
+            }
             localStorage.setItem("biometricToken", data.biometricToken);
             await verifyEligibility(data.biometricToken);
         } catch (error) {
-            setMessage(error.message || "Biometric verification was cancelled.");
+            setMessage(getWebAuthnErrorMessage(error, "Biometric/device verification failed. Please try again."));
         } finally {
             setBiometricBusy(false);
         }
@@ -89,7 +168,13 @@ function ReviewVote() {
             body: JSON.stringify({ electionId: election.id }),
         });
         const data = await response.json();
-        if (!response.ok) throw new Error(data.message || "Eligibility verification failed.");
+        if (!response.ok) {
+            if (isSessionError(data.message)) {
+                clearSessionAndRedirect();
+                return;
+            }
+            throw new Error(data.message || "Eligibility verification failed.");
+        }
         localStorage.setItem("votingToken", data.votingToken);
         localStorage.setItem("votingElectionId", String(data.electionId));
         setEligibilityVerified(true);
@@ -220,19 +305,33 @@ function ReviewVote() {
                     </div>
 
                     <div style={{ background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 18, padding: 20, marginBottom: 24 }}>
-                        <h3 style={{ marginTop: 0 }}>Voter verification</h3>
+                        <h3 style={{ marginTop: 0 }}>{isMobileDevice ? "Mobile biometric verification" : "Face authentication / device authentication"}</h3>
                         <ul style={{ lineHeight: 1.8, paddingLeft: 20, color: "#334155" }}>
                             <li>✓ Account verified</li>
-                            <li>{biometricEnrolled ? "✓" : "○"} Biometric enrolled</li>
+                            <li>{biometricEnrolled ? "✓" : "○"} {isMobileDevice ? "Mobile biometric enrolled" : "Device biometric enrolled"}</li>
                             <li>{eligibilityVerified ? "✓" : "○"} Eligible for this election</li>
                             <li>{eligibilityVerified ? "✓ Voting status: Not yet voted" : "○ Voting status: Pending verification"}</li>
                         </ul>
-                        <p style={{ color: "#475569" }}>Your device will ask for fingerprint, face recognition, or another secure screen-lock verification. The private biometric data never leaves your device.</p>
+                        <p style={{ color: "#475569" }}>
+                            {!supportsWebAuthn
+                                ? "This browser cannot complete a WebAuthn/passkey check. Use a supported device for secure biometric verification."
+                                : isMobileDevice
+                                    ? "Use your phone's fingerprint or face authentication. This secure check uses the existing WebAuthn/passkey flow on your device."
+                                    : "Use your computer's supported face or device authentication. This secure check uses the existing WebAuthn/passkey flow on this device."}
+                        </p>
                         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                            {!biometricEnrolled && <button type="button" onClick={enrollBiometric} disabled={biometricBusy} style={buttonSecondary}>{biometricBusy ? "Waiting for device..." : "Enroll biometric"}</button>}
-                            {biometricEnrolled && !eligibilityVerified && <button type="button" onClick={verifyBiometric} disabled={biometricBusy || !election} style={buttonPrimary}>{biometricBusy ? "Checking..." : "Verify & Check Eligibility"}</button>}
+                            {!biometricEnrolled && (
+                                <button type="button" onClick={enrollBiometric} disabled={biometricBusy || !supportsWebAuthn} style={buttonSecondary}>
+                                    {biometricBusy ? "Waiting for device..." : isMobileDevice ? "Enroll mobile biometric" : "Enroll device authentication"}
+                                </button>
+                            )}
+                            {biometricEnrolled && !eligibilityVerified && (
+                                <button type="button" onClick={verifyBiometric} disabled={biometricBusy || !election || !supportsWebAuthn} style={buttonPrimary}>
+                                    {biometricBusy ? "Checking..." : isMobileDevice ? "Verify mobile biometric" : "Verify device authentication"}
+                                </button>
+                            )}
                         </div>
-                        <p style={{ minHeight: 24, color: message.toLowerCase().includes("failed") || message.toLowerCase().includes("unable") || message.toLowerCase().includes("support") ? "#b91c1c" : "#166534", marginBottom: 0 }}>{message}</p>
+                        <p style={{ minHeight: 24, color: message.toLowerCase().includes("failed") || message.toLowerCase().includes("unable") || message.toLowerCase().includes("support") || message.toLowerCase().includes("device does not support") ? "#b91c1c" : "#166534", marginBottom: 0 }}>{message || (supportsWebAuthn ? "Ready to verify" : "WebAuthn unsupported on this device")}</p>
                     </div>
 
                     <div>

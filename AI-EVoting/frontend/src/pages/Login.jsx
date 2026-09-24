@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import Navbar from "../components/Navbar";
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:5002";
@@ -9,7 +9,8 @@ const DEMO_VOTER = { email: "voter@example.com", password: "VoterPass123" };
 function Login() {
     const [email, setEmail] = useState("");
     const [password, setPassword] = useState("");
-    const [message, setMessage] = useState("");
+    const location = useLocation();
+    const [message, setMessage] = useState(location.state?.message || "");
     const navigate = useNavigate();
 
     const loginUser = async (e) => {

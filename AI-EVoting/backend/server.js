@@ -26,7 +26,10 @@ const app = express();
 const jwtSecret = process.env.JWT_SECRET || 'dev-secret-change-me';
 const allowedOrigins = new Set(["http://localhost:5173", "http://localhost:5174"]);
 const webAuthnRpID = process.env.WEBAUTHN_RP_ID || "localhost";
-const webAuthnOrigin = process.env.WEBAUTHN_ORIGIN || "http://localhost:5173";
+const webAuthnOrigins = (process.env.WEBAUTHN_ORIGIN || "http://localhost:5173,http://localhost:5174")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 const biometricChallenges = new Map();
 const usedBiometricTokens = new Set();
 
@@ -548,7 +551,7 @@ app.post("/api/biometric/register/verify", sensitiveLimiter, authenticateToken, 
     const verification = await verifyRegistrationResponse({
       response,
       expectedChallenge: optionsChallenge,
-      expectedOrigin: webAuthnOrigin,
+      expectedOrigin: webAuthnOrigins,
       expectedRPID: webAuthnRpID,
       requireUserVerification: true,
     });
@@ -602,7 +605,7 @@ app.post("/api/biometric/authenticate/verify", sensitiveLimiter, authenticateTok
     const verification = await verifyAuthenticationResponse({
       response,
       expectedChallenge: optionsChallenge,
-      expectedOrigin: webAuthnOrigin,
+      expectedOrigin: webAuthnOrigins,
       expectedRPID: webAuthnRpID,
       requireUserVerification: true,
       credential: {
