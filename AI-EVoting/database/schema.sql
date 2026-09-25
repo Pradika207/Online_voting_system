@@ -13,6 +13,43 @@ CREATE TABLE IF NOT EXISTS users (
     biometric_counter INTEGER DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS face_templates (
+    id SERIAL PRIMARY KEY,
+    voter_id INT UNIQUE NOT NULL REFERENCES users(id),
+    encrypted_embedding TEXT NOT NULL,
+    embedding_model VARCHAR(100) NOT NULL,
+    embedding_version VARCHAR(30) NOT NULL,
+    encryption_key_version VARCHAR(30) NOT NULL,
+    enrolled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    revoked_at TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS face_verification_challenges (
+    id UUID PRIMARY KEY,
+    voter_id INT NOT NULL REFERENCES users(id),
+    session_jti VARCHAR(255) NOT NULL,
+    operation VARCHAR(30) NOT NULL,
+    challenge VARCHAR(100) NOT NULL,
+    expires_at TIMESTAMP NOT NULL,
+    attempts INT NOT NULL DEFAULT 0,
+    consumed_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS face_verification_proofs (
+    id UUID PRIMARY KEY,
+    voter_id INT NOT NULL REFERENCES users(id),
+    session_jti VARCHAR(255) NOT NULL,
+    challenge_id UUID NOT NULL REFERENCES face_verification_challenges(id),
+    expires_at TIMESTAMP NOT NULL,
+    used_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS face_challenges_voter_lookup ON face_verification_challenges(voter_id, expires_at);
+CREATE INDEX IF NOT EXISTS face_proofs_voter_lookup ON face_verification_proofs(voter_id, expires_at);
+
 -- Ensure a role column exists for admin/voter
 ALTER TABLE users
 ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'voter';

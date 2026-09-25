@@ -32,6 +32,51 @@ const webAuthnOrigins = (process.env.WEBAUTHN_ORIGIN || "http://localhost:5173,h
   .filter(Boolean);
 const biometricChallenges = new Map();
 const usedBiometricTokens = new Set();
+const registrationAttemptTracker = new Map();
+const biometricFailureTracker = new Map();
+const faceServiceUrl = process.env.FACE_SERVICE_URL || "http://127.0.0.1:8100";
+const faceSimilarityThreshold = Number(process.env.FACE_SIMILARITY_THRESHOLD || 0.62);
+const faceTemplateKey = (() => {
+  const configured = process.env.FACE_TEMPLATE_ENCRYPTION_KEY;
+  if (configured) {
+    const key = Buffer.from(configured, "base64");
+    if (key.length !== 32) throw new Error("FACE_TEMPLATE_ENCRYPTION_KEY must be a base64-encoded 32-byte key");
+    return key;
+  }
+  if (process.env.NODE_ENV === "production") throw new Error("FACE_TEMPLATE_ENCRYPTION_KEY is required in production");
+  return crypto.createHash("sha256").update(jwtSecret).digest();
+})();
+
+function trackWindowedEvents(store, key, windowMs = 5 * 60 * 1000, threshold = 3) {
+  const now = Date.now();
+  const events = (store.get(key) || []).filter((timestamp) => now - timestamp <= windowMs);
+  events.push(now);
+  store.set(key, events);
+  return { count: events.length, thresholdReached: events.length >= threshold };
+}
+
+function trackSuspiciousRegistration(email, phone, userId = null) {
+  const keys = [
+    `register:${String(email || '').trim().toLowerCase()}`,
+    `register:${String(phone || '').trim()}`,
+  ];
+
+  for (const key of keys) {
+    const summary = trackWindowedEvents(registrationAttemptTracker, key, 5 * 60 * 1000, 3);
+    if (summary.thresholdReached) {
+      const reason = key.includes('register:') ? 'Repeated registration attempts detected' : 'Repeated suspicious registration attempt';
+      logSecurityEvent(userId || null, 'SUSPICIOUS_REQUEST_BURST', 'HIGH', reason, { source: 'registration', key, count: summary.count });
+    }
+  }
+}
+
+function trackBiometricFailure(userId) {
+  if (!userId) return;
+  const summary = trackWindowedEvents(biometricFailureTracker, `biometric:${userId}`, 5 * 60 * 1000, 3);
+  if (summary.thresholdReached) {
+    logSecurityEvent(userId, 'BIOMETRIC_FAILURE', 'HIGH', 'Repeated biometric verification failures detected', { count: summary.count });
+  }
+}
 
 function saveBiometricChallenge(userId, type, challenge) {
   biometricChallenges.set(`${userId}:${type}`, { challenge, expiresAt: Date.now() + 120000 });
@@ -46,6 +91,25 @@ function takeBiometricChallenge(userId, type, expectedChallenge) {
 
 function hashVotingToken(token) {
   return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+function encryptFaceEmbedding(embedding) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", faceTemplateKey, iv);
+  const ciphertext = Buffer.concat([cipher.update(Buffer.from(JSON.stringify(embedding), "utf8")), cipher.final()]);
+  return JSON.stringify({ version: 1, iv: iv.toString("base64"), ciphertext: ciphertext.toString("base64"), authTag: cipher.getAuthTag().toString("base64") });
+}
+
+function decryptFaceEmbedding(record) {
+  const value = JSON.parse(record);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", faceTemplateKey, Buffer.from(value.iv, "base64"));
+  decipher.setAuthTag(Buffer.from(value.authTag, "base64"));
+  return JSON.parse(Buffer.concat([decipher.update(Buffer.from(value.ciphertext, "base64")), decipher.final()]).toString("utf8"));
+}
+
+async function faceService(pathname, payload) {
+  const response = await axios.post(`${faceServiceUrl}${pathname}`, payload, { timeout: 15000 });
+  return response.data;
 }
 
 function createVotingToken() {
@@ -169,6 +233,112 @@ function normalizePhone(phone) {
   return String(phone || "").trim();
 }
 
+function classifyRiskScore(score) {
+  if (score >= 25) return "CRITICAL";
+  if (score >= 18) return "HIGH";
+  if (score >= 10) return "MEDIUM";
+  return "LOW";
+}
+
+function evaluateSecurityEvent(eventType, metadata = {}) {
+  const rules = {
+    LOGIN_FAILED: 4,
+    ACCOUNT_LOCKED: 8,
+    BIOMETRIC_FAILURE: 7,
+    BIOMETRIC_REJECTED: 9,
+    TOKEN_REQUESTED: 3,
+    VOTE_REJECTED: 8,
+    RATE_LIMITED: 6,
+    DUPLICATE_REGISTRATION: 10,
+    DUPLICATE_IDENTITY: 12,
+    AUTHORIZATION_FAILURE: 5,
+    RECEIPT_LOOKUP_FAILED: 4,
+    SUSPICIOUS_REQUEST_BURST: 11,
+    PAYMENT_OR_IDENTITY_MISMATCH: 9,
+  };
+
+  const score = Number(rules[eventType] || 0) + Number(metadata.extraScore || 0) + Number(metadata.count || 0);
+  const reason = metadata.reason || `Risk score derived from ${eventType}`;
+  return {
+    score,
+    riskLevel: classifyRiskScore(score),
+    reason,
+  };
+}
+
+async function logSecurityEvent(userId, eventType, riskLevel = "LOW", reason = "", metadata = {}) {
+  if (!eventType) return;
+  try {
+    await pool.query(
+      `INSERT INTO security_events (user_id, event_type, risk_level, reason, metadata)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [userId || null, eventType, riskLevel, reason || null, JSON.stringify(metadata || {})]
+    );
+
+    if (userId) {
+      const scoreInfo = evaluateSecurityEvent(eventType, { ...metadata, reason });
+      const nextRiskLevel = scoreInfo.riskLevel;
+      await pool.query(
+        `UPDATE users
+         SET suspicious = CASE WHEN $1 IN ('HIGH', 'CRITICAL') THEN 1 ELSE suspicious END,
+             suspicion_level = CASE WHEN $2 = 'LOW' THEN suspicion_level ELSE $2 END,
+             risk_flags = risk_flags + 1
+         WHERE id = $3`,
+        [nextRiskLevel, nextRiskLevel, userId]
+      );
+    }
+  } catch (error) {
+    console.error("Failed to record security event:", error);
+  }
+}
+
+async function getSecurityOverview() {
+  const [securityResult, fraudResult, suspiciousUserResult, auditResult] = await Promise.all([
+    pool.query(`
+      SELECT
+        COUNT(*) AS event_count,
+        SUM(CASE WHEN risk_level = 'HIGH' THEN 1 ELSE 0 END) AS high_risk_count,
+        SUM(CASE WHEN event_type = 'LOGIN_FAILED' THEN 1 ELSE 0 END) AS failed_login_count,
+        SUM(CASE WHEN event_type = 'VOTE_BLOCKED_SUSPICIOUS' THEN 1 ELSE 0 END) AS suspicious_vote_count
+      FROM security_events
+    `),
+    pool.query(`
+      SELECT
+        COUNT(*) AS alert_count,
+        SUM(CASE WHEN prediction = 'suspicious' THEN 1 ELSE 0 END) AS suspicious_alert_count
+      FROM fraud_alerts
+    `),
+    pool.query(`
+      SELECT COUNT(*) AS suspicious_users
+      FROM users
+      WHERE suspicious = 1 OR risk_flags > 0
+    `),
+    verifyAuditChain(),
+  ]);
+
+  const security = securityResult.rows[0] || {};
+  const fraud = fraudResult.rows[0] || {};
+  const suspiciousUsers = suspiciousUserResult.rows[0] || {};
+
+  return {
+    summary: {
+      alertCount: Number(fraud.alert_count || 0) + Number(security.event_count || 0),
+      suspiciousAlertCount: Number(fraud.suspicious_alert_count || 0),
+      highRiskEventCount: Number(security.high_risk_count || 0),
+      failedLoginCount: Number(security.failed_login_count || 0),
+      suspiciousVoteCount: Number(security.suspicious_vote_count || 0),
+      suspiciousUserCount: Number(suspiciousUsers.suspicious_users || 0),
+      auditStatus: auditResult.valid ? "verified" : "tampered",
+    },
+    events: (await pool.query(
+      `SELECT id, user_id, event_type, risk_level, reason, metadata, created_at
+       FROM security_events
+       ORDER BY created_at DESC
+       LIMIT 10`
+    )).rows,
+  };
+}
+
 function getFallbackPrediction(metrics) {
   const riskScore = (
     (Number(metrics.login_attempts || 0) * 2) +
@@ -189,7 +359,7 @@ app.use(
     origin: ["http://localhost:5173", "http://localhost:5174"]
   })
 );
-app.use(express.json({ limit: process.env.REQUEST_BODY_LIMIT || "100kb" }));
+app.use(express.json({ limit: process.env.REQUEST_BODY_LIMIT || "8mb" }));
 
 function trustedBrowserOrigin(req, res, next) {
   if (["POST", "PUT", "PATCH", "DELETE"].includes(req.method) && req.headers.origin && !allowedOrigins.has(req.headers.origin)) {
@@ -246,6 +416,7 @@ function recordLoginFailure(key) {
     state.attempts = 0;
   }
   loginFailures.set(key, state);
+  return state;
 }
 
 function clearLoginFailures(key) {
@@ -354,6 +525,23 @@ app.get("/", (req, res) => {
   res.json({ message: "AI E-Voting Backend is running", otpProvider: "Firebase Phone Authentication" });
 });
 
+app.get("/api/health", async (req, res) => {
+  try {
+    const dbCheck = await pool.query("SELECT 1 AS ok");
+    const auditState = await verifyAuditChain();
+    res.json({
+      status: "ok",
+      timestamp: new Date().toISOString(),
+      uptimeSeconds: Math.round(process.uptime()),
+      database: dbCheck.rows.length ? "ok" : "unavailable",
+      auditIntegrity: auditState.valid ? "verified" : "warning",
+    });
+  } catch (error) {
+    console.error("Health check failed:", error);
+    res.status(503).json({ status: "degraded", message: "Service unavailable" });
+  }
+});
+
 app.post(
   "/api/register",
   body("name").trim().isLength({ min: 2, max: 100 }),
@@ -368,41 +556,69 @@ app.post(
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const { name, email, password, phone, firebaseVerified } = req.body;
+      const { name, email, password, phone, firebaseVerified, identityReference } = req.body;
       const normalizedEmail = String(email || "").trim().toLowerCase();
       const normalizedPhone = normalizePhone(phone);
+      const normalizedIdentity = String(identityReference || "").trim();
+
+      trackSuspiciousRegistration(normalizedEmail, normalizedPhone, null);
 
       if (!normalizedEmail || !normalizedPhone) {
         return res.status(400).json({ message: "Email and phone number are required." });
       }
 
       if (firebaseVerified === true) {
-        const existingUser = await pool.query("SELECT id FROM users WHERE email = $1", [normalizedEmail]);
-        if (existingUser.rows.length > 0) {
-          return res.status(409).json({ message: "This email is already registered." });
+          const duplicateEmailCheck = await pool.query("SELECT id FROM users WHERE email = $1", [normalizedEmail]);
+          if (duplicateEmailCheck.rows.length > 0) {
+            await logSecurityEvent(duplicateEmailCheck.rows[0].id, "DUPLICATE_REGISTRATION", "HIGH", "Duplicate email registration attempt", { duplicateField: "email" });
+            return res.status(409).json({ message: "This email is already registered." });
+          }
+
+          const duplicatePhoneCheck = await pool.query("SELECT id FROM users WHERE phone = $1", [normalizedPhone]);
+          if (duplicatePhoneCheck.rows.length > 0) {
+            await logSecurityEvent(duplicatePhoneCheck.rows[0].id, "DUPLICATE_REGISTRATION", "HIGH", "Duplicate phone registration attempt", { duplicateField: "phone" });
+            return res.status(409).json({ message: "This phone number is already registered." });
+          }
+
+          if (normalizedIdentity) {
+            const existingIdentity = await pool.query("SELECT id FROM users WHERE identity_reference = $1", [normalizedIdentity]);
+            if (existingIdentity.rows.length > 0) {
+              await logSecurityEvent(existingIdentity.rows[0].id, "DUPLICATE_IDENTITY", "CRITICAL", "Duplicate identity reference registration attempt", { duplicateField: "identity_reference" });
+              return res.status(409).json({ message: "This identity reference is already registered." });
+            }
+          }
+
+          const registrationEventCount = trackWindowedEvents(registrationAttemptTracker, `register:${normalizedEmail}`, 5 * 60 * 1000, 3);
+          if (registrationEventCount.thresholdReached) {
+            await logSecurityEvent(null, "SUSPICIOUS_REQUEST_BURST", "HIGH", "Repeated registration attempts for the same email address", { email: normalizedEmail, count: registrationEventCount.count });
+            return res.status(429).json({ message: "Too many registration attempts. Please try again later." });
+          }
+
+          const hashedPassword = await bcrypt.hash(password, 10);
+          const insertRes = await pool.query(
+            `INSERT INTO users (name, email, phone, identity_reference, password, role)
+             VALUES ($1, $2, $3, $4, $5, 'voter') RETURNING id`,
+            [name, normalizedEmail, normalizedPhone, normalizedIdentity || null, hashedPassword]
+          );
+
+          await pool.query(
+            "INSERT INTO election_eligibility (voter_id, election_id) SELECT $1, id FROM elections WHERE status IN ('upcoming', 'active') ON CONFLICT DO NOTHING",
+            [insertRes.rows[0].id]
+          );
+
+          await logAudit(insertRes.rows[0].id, "REGISTER");
+          await logSecurityEvent(insertRes.rows[0].id, "REGISTRATION_SUCCESS", "LOW", "User registered successfully", { email: normalizedEmail });
+          return res.status(201).json({ message: "Registration successful. Please login to continue." });
         }
-
-        const hashedPassword = await bcrypt.hash(password, 10);
-        const insertRes = await pool.query(
-          `INSERT INTO users (name, email, phone, password, role)
-           VALUES ($1, $2, $3, $4, 'voter') RETURNING id`,
-          [name, normalizedEmail, normalizedPhone, hashedPassword]
-        );
-
-        await pool.query(
-          "INSERT INTO election_eligibility (voter_id, election_id) SELECT $1, id FROM elections WHERE status IN ('upcoming', 'active') ON CONFLICT DO NOTHING",
-          [insertRes.rows[0].id]
-        );
-
-        await logAudit(insertRes.rows[0].id, "REGISTER");
-        return res.status(201).json({ message: "Registration successful. Please login to continue." });
-      }
 
       return res.status(400).json({
         message: "Complete phone verification with Firebase before registering.",
       });
     } catch (error) {
       console.error("Registration error:", error);
+      if (error?.code === "23505" || /duplicate key|UNIQUE constraint|unique/i.test(String(error?.message || ""))) {
+        return res.status(409).json({ message: "This email or phone number is already registered." });
+      }
       res.status(500).json({ message: "Server error" });
     }
   }
@@ -433,7 +649,12 @@ app.post(
       if (result.rows.length === 0) {
         // Audit: login failed (unknown email)
         await logAudit(null, "LOGIN_FAILED");
-        recordLoginFailure(attemptKey);
+        const attemptState = recordLoginFailure(attemptKey);
+        if (attemptState.lockedUntil && attemptState.lockedUntil > Date.now()) {
+          await logSecurityEvent(null, "ACCOUNT_LOCKED", "MEDIUM", "Authentication lockout activated after repeated failures", { key: attemptKey, attempts: attemptState.attempts });
+        } else {
+          await logSecurityEvent(null, "LOGIN_FAILED", "LOW", "Failed authentication attempt", { key: attemptKey, source: "login" });
+        }
         return res.status(401).json({ message: "Invalid email or password" });
       }
 
@@ -444,7 +665,12 @@ app.post(
       if (!passwordMatch) {
         // Audit: login failed for this user
         await logAudit(user.id, "LOGIN_FAILED");
-        recordLoginFailure(attemptKey);
+        const attemptState = recordLoginFailure(attemptKey);
+        if (attemptState.lockedUntil && attemptState.lockedUntil > Date.now()) {
+          await logSecurityEvent(user.id, "ACCOUNT_LOCKED", "HIGH", "Account lockout triggered by repeated failed logins", { userId: user.id, attempts: attemptState.attempts });
+        } else {
+          await logSecurityEvent(user.id, "LOGIN_FAILED", "MEDIUM", "Failed login attempt recorded for risk review", { userId: user.id, attempts: attemptState.attempts });
+        }
         return res.status(401).json({ message: "Invalid email or password" });
       }
 
@@ -491,9 +717,22 @@ app.get("/api/candidates", async (req, res) => {
   try {
     const electionId = req.query.electionId ? Number(req.query.electionId) : null;
     if (req.query.electionId && (!Number.isInteger(electionId) || electionId <= 0)) return res.status(400).json({ message: "Invalid election ID" });
-    const result = electionId
-      ? await pool.query("SELECT id, name, party, photo_url, manifesto, election_id, active, is_nota FROM candidates WHERE active = 1 AND (election_id = $1 OR election_id IS NULL) ORDER BY is_nota, id", [electionId])
-      : await pool.query("SELECT id, name, party, photo_url, manifesto, election_id, active, is_nota FROM candidates WHERE active = 1 ORDER BY id");
+
+    let targetElectionId = electionId;
+    if (!targetElectionId) {
+      const activeElection = await pool.query(
+        `SELECT id FROM elections WHERE status = 'active' ORDER BY id DESC LIMIT 1`
+      );
+      if (activeElection.rows.length === 0) {
+        return res.status(404).json({ message: "No active election is available" });
+      }
+      targetElectionId = Number(activeElection.rows[0].id);
+    }
+
+    const result = await pool.query(
+      "SELECT id, name, party, photo_url, manifesto, election_id, active, is_nota FROM candidates WHERE active = 1 AND (election_id = $1 OR election_id IS NULL) ORDER BY is_nota, id",
+      [targetElectionId]
+    );
 
     res.json(result.rows);
   } catch (error) {
@@ -615,7 +854,11 @@ app.post("/api/biometric/authenticate/verify", sensitiveLimiter, authenticateTok
       },
     });
 
-    if (!verification.verified) return res.status(401).json({ message: "Biometric verification failed" });
+    if (!verification.verified) {
+      trackBiometricFailure(req.user.userId);
+      await logSecurityEvent(req.user.userId, "BIOMETRIC_FAILURE", "MEDIUM", "Biometric verification failed", { userId: req.user.userId, source: "authentication" });
+      return res.status(401).json({ message: "Biometric verification failed" });
+    }
 
     await pool.query("UPDATE users SET biometric_counter = $1 WHERE id = $2", [verification.authenticationInfo.newCounter, req.user.userId]);
     const biometricToken = jwt.sign({ userId: req.user.userId, purpose: "mfa", nonce: crypto.randomBytes(16).toString("hex") }, jwtSecret, { expiresIn: "5m", jwtid: crypto.randomBytes(16).toString("hex") });
@@ -627,12 +870,99 @@ app.post("/api/biometric/authenticate/verify", sensitiveLimiter, authenticateTok
   }
 });
 
+app.get("/api/face/status", authenticateToken, async (req, res) => {
+  const result = await pool.query("SELECT voter_id FROM face_templates WHERE voter_id = $1 AND revoked_at IS NULL", [req.user.userId]);
+  res.json({ enrolled: result.rows.length > 0 });
+});
+
+app.post("/api/face/challenge", sensitiveLimiter, authenticateToken, async (req, res) => {
+  const operation = req.body.operation === "enrollment" ? "enrollment" : "verification";
+  if (operation === "verification") {
+    const existing = await pool.query("SELECT id FROM face_templates WHERE voter_id = $1 AND revoked_at IS NULL", [req.user.userId]);
+    if (!existing.rows.length) return res.status(400).json({ message: "Enroll camera face verification before voting" });
+  }
+  const challengeId = crypto.randomUUID();
+  const challenge = crypto.randomBytes(24).toString("base64url");
+  const expiresAt = new Date(Date.now() + 120000).toISOString();
+  await pool.query(
+    "INSERT INTO face_verification_challenges (id, voter_id, session_jti, operation, challenge, expires_at) VALUES ($1, $2, $3, $4, $5, $6)",
+    [challengeId, req.user.userId, req.user.jti, operation, challenge, expiresAt]
+  );
+  res.json({ challengeId, challenge, operation, expiresAt, liveness: { type: "blink_then_turn", requiredFrames: 3 } });
+});
+
+app.post("/api/face/enrollment", sensitiveLimiter, authenticateToken, async (req, res) => {
+  try {
+    const { challengeId, challenge, frames } = req.body;
+    if (!challengeId || !challenge || !Array.isArray(frames) || frames.length < 3 || frames.length > 8) return res.status(400).json({ message: "A complete camera liveness sequence is required" });
+    const challengeResult = await pool.query(
+      "SELECT * FROM face_verification_challenges WHERE id = $1 AND voter_id = $2 AND session_jti = $3 AND operation = 'enrollment' AND consumed_at IS NULL AND expires_at > CURRENT_TIMESTAMP",
+      [challengeId, req.user.userId, req.user.jti]
+    );
+    if (!challengeResult.rows.length || challengeResult.rows[0].challenge !== challenge) return res.status(403).json({ message: "Face enrollment challenge expired or invalid" });
+    const result = await faceService("/enroll", { challenge, frames });
+    if (!result.livenessPassed || !Array.isArray(result.embedding) || result.embedding.length < 32) return res.status(400).json({ message: "Liveness verification failed" });
+    await pool.query("UPDATE face_verification_challenges SET consumed_at = CURRENT_TIMESTAMP WHERE id = $1", [challengeId]);
+    await pool.query(
+      `INSERT INTO face_templates (voter_id, encrypted_embedding, embedding_model, embedding_version, encryption_key_version)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (voter_id) DO UPDATE SET encrypted_embedding = EXCLUDED.encrypted_embedding, embedding_model = EXCLUDED.embedding_model, embedding_version = EXCLUDED.embedding_version, encryption_key_version = EXCLUDED.encryption_key_version, updated_at = CURRENT_TIMESTAMP, revoked_at = NULL`,
+      [req.user.userId, encryptFaceEmbedding(result.embedding), result.model || "insightface-arcface", result.version || "1", process.env.FACE_TEMPLATE_KEY_VERSION || "1"]
+    );
+    await logAudit(req.user.userId, "FACE_ENROLLED");
+    res.json({ enrolled: true, message: "Camera face verification enrolled successfully" });
+  } catch (error) {
+    trackBiometricFailure(req.user.userId);
+    console.error("Face enrollment error:", error.message || error);
+    res.status(400).json({ message: "Face enrollment could not be completed" });
+  }
+});
+
+app.post("/api/face/verify", sensitiveLimiter, authenticateToken, async (req, res) => {
+  try {
+    const { challengeId, challenge, frames } = req.body;
+    if (!challengeId || !challenge || !Array.isArray(frames) || frames.length < 3 || frames.length > 8) return res.status(400).json({ message: "A complete camera liveness sequence is required" });
+    const challengeResult = await pool.query(
+      "SELECT * FROM face_verification_challenges WHERE id = $1 AND voter_id = $2 AND session_jti = $3 AND operation = 'verification' AND consumed_at IS NULL AND expires_at > CURRENT_TIMESTAMP AND attempts < 3",
+      [challengeId, req.user.userId, req.user.jti]
+    );
+    if (!challengeResult.rows.length || challengeResult.rows[0].challenge !== challenge) return res.status(403).json({ message: "Face verification challenge expired or invalid" });
+    await pool.query("UPDATE face_verification_challenges SET attempts = attempts + 1 WHERE id = $1", [challengeId]);
+    const templateResult = await pool.query("SELECT encrypted_embedding FROM face_templates WHERE voter_id = $1 AND revoked_at IS NULL", [req.user.userId]);
+    if (!templateResult.rows.length) return res.status(400).json({ message: "Camera face verification is not enrolled" });
+    const result = await faceService("/verify", { challenge, frames, template: decryptFaceEmbedding(templateResult.rows[0].encrypted_embedding) });
+    if (!result.livenessPassed || Number(result.similarity) < faceSimilarityThreshold) {
+      trackBiometricFailure(req.user.userId);
+      await logSecurityEvent(req.user.userId, "FACE_VERIFICATION_FAILURE", "MEDIUM", "Camera face verification failed", { livenessPassed: Boolean(result.livenessPassed) });
+      return res.status(401).json({ message: "Face verification failed" });
+    }
+    await pool.query("UPDATE face_verification_challenges SET consumed_at = CURRENT_TIMESTAMP WHERE id = $1", [challengeId]);
+    const proofId = crypto.randomUUID();
+    const proofExpiry = new Date(Date.now() + 180000).toISOString();
+    await pool.query("INSERT INTO face_verification_proofs (id, voter_id, session_jti, challenge_id, expires_at) VALUES ($1, $2, $3, $4, $5)", [proofId, req.user.userId, req.user.jti, challengeId, proofExpiry]);
+    await logAudit(req.user.userId, "FACE_VERIFIED");
+    res.json({ verified: true, faceProof: proofId, expiresAt: proofExpiry });
+  } catch (error) {
+    trackBiometricFailure(req.user.userId);
+    console.error("Face verification error:", error.message || error);
+    res.status(401).json({ message: "Face verification failed" });
+  }
+});
+
 app.post("/api/voter/eligibility", sensitiveLimiter, authenticateToken, async (req, res) => {
   try {
     const electionId = Number(req.body.electionId);
     const biometricHeader = req.headers["x-biometric-token"];
+    const faceProof = req.headers["x-face-proof"];
     if (!Number.isInteger(electionId) || electionId <= 0) return res.status(400).json({ message: "A valid election is required" });
     if (!biometricHeader) return res.status(403).json({ message: "Biometric verification is required" });
+    if (!faceProof) return res.status(403).json({ message: "Camera face verification is required" });
+
+    const faceProofResult = await pool.query(
+      "SELECT id FROM face_verification_proofs WHERE id = $1 AND voter_id = $2 AND session_jti = $3 AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP",
+      [faceProof, req.user.userId, req.user.jti]
+    );
+    if (!faceProofResult.rows.length) return res.status(403).json({ message: "Camera face proof is expired, invalid, or already used" });
 
     let biometricPayload;
     try {
@@ -668,6 +998,7 @@ app.post("/api/voter/eligibility", sensitiveLimiter, authenticateToken, async (r
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
     await pool.query("INSERT INTO voting_tokens (token_hash, voter_id, election_id, expires_at) VALUES ($1, $2, $3, $4)", [tokenHash, req.user.userId, electionId, expiresAt]);
     usedBiometricTokens.add(biometricTokenId);
+    await pool.query("UPDATE face_verification_proofs SET used_at = CURRENT_TIMESTAMP WHERE id = $1", [faceProof]);
     await logAudit(req.user.userId, "VOTER_ELIGIBILITY_VERIFIED");
     res.json({ eligible: true, electionId, votingToken, expiresAt });
   } catch (error) {
@@ -1087,6 +1418,11 @@ app.post("/api/vote", sensitiveLimiter, authenticateToken, async (req, res) => {
 
     if (prediction === "suspicious") {
       await logAudit(userId, "VOTE_BLOCKED_SUSPICIOUS");
+      await logSecurityEvent(userId, "VOTE_REJECTED", "HIGH", "Vote rejected after suspicious activity evaluation", {
+        voterId: userId,
+        prediction,
+        reason: "Suspicious activity signal crossed the rule threshold",
+      });
       return res.status(403).json({
         message: "Suspicious activity detected",
         warning: aiWarning || null
@@ -1342,6 +1678,21 @@ app.get(
     } catch (error) {
       console.error(error);
       res.status(500).json({ message: "Failed to get fraud summary" });
+    }
+  }
+);
+
+app.get(
+  "/api/admin/security-overview",
+  authenticateToken,
+  adminOnly,
+  async (req, res) => {
+    try {
+      const overview = await getSecurityOverview();
+      res.json(overview);
+    } catch (error) {
+      console.error("Security overview error:", error);
+      res.status(500).json({ message: "Failed to load security overview" });
     }
   }
 );

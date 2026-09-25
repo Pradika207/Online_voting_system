@@ -18,13 +18,55 @@ if (useSqlite) {
       name TEXT NOT NULL,
       email TEXT UNIQUE NOT NULL,
       phone TEXT,
+      identity_reference TEXT,
       password TEXT NOT NULL,
       has_voted INTEGER DEFAULT 0,
       role TEXT DEFAULT 'voter',
       verified INTEGER DEFAULT 1,
+      suspicious INTEGER DEFAULT 0,
+      suspicion_level TEXT DEFAULT 'LOW',
+      risk_flags INTEGER DEFAULT 0,
       biometric_credential_id TEXT,
       biometric_public_key TEXT,
       biometric_counter INTEGER DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS face_templates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      voter_id INTEGER UNIQUE NOT NULL,
+      encrypted_embedding TEXT NOT NULL,
+      embedding_model TEXT NOT NULL,
+      embedding_version TEXT NOT NULL,
+      encryption_key_version TEXT NOT NULL,
+      enrolled_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      revoked_at DATETIME,
+      FOREIGN KEY(voter_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS face_verification_challenges (
+      id TEXT PRIMARY KEY,
+      voter_id INTEGER NOT NULL,
+      session_jti TEXT NOT NULL,
+      operation TEXT NOT NULL,
+      challenge TEXT NOT NULL,
+      expires_at DATETIME NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      consumed_at DATETIME,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(voter_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS face_verification_proofs (
+      id TEXT PRIMARY KEY,
+      voter_id INTEGER NOT NULL,
+      session_jti TEXT NOT NULL,
+      challenge_id TEXT NOT NULL,
+      expires_at DATETIME NOT NULL,
+      used_at DATETIME,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(voter_id) REFERENCES users(id),
+      FOREIGN KEY(challenge_id) REFERENCES face_verification_challenges(id)
     );
 
     CREATE TABLE IF NOT EXISTS candidates (
@@ -120,6 +162,17 @@ if (useSqlite) {
       FOREIGN KEY(user_id) REFERENCES users(id)
     );
 
+    CREATE TABLE IF NOT EXISTS security_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER,
+      event_type TEXT NOT NULL,
+      risk_level TEXT DEFAULT 'LOW',
+      reason TEXT,
+      metadata TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(user_id) REFERENCES users(id)
+    );
+
     CREATE TABLE IF NOT EXISTS audit_chain_state (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       last_event_id INTEGER,
@@ -177,8 +230,12 @@ if (useSqlite) {
   const tableMigrations = {
     users: [
       { name: 'phone', type: 'TEXT' },
+      { name: 'identity_reference', type: 'TEXT' },
       { name: 'role', type: "TEXT DEFAULT 'voter'" },
       { name: 'verified', type: 'INTEGER DEFAULT 1' },
+      { name: 'suspicious', type: 'INTEGER DEFAULT 0' },
+      { name: 'suspicion_level', type: "TEXT DEFAULT 'LOW'" },
+      { name: 'risk_flags', type: 'INTEGER DEFAULT 0' },
       { name: 'biometric_credential_id', type: 'TEXT' },
       { name: 'biometric_public_key', type: 'TEXT' },
       { name: 'biometric_counter', type: 'INTEGER DEFAULT 0' },
@@ -233,6 +290,11 @@ if (useSqlite) {
       db.run("CREATE INDEX IF NOT EXISTS eligibility_voter_election_lookup ON election_eligibility(voter_id, election_id)")
       db.run("CREATE INDEX IF NOT EXISTS tokens_lookup ON voting_tokens(token_hash, voter_id, election_id)")
       db.run("CREATE INDEX IF NOT EXISTS receipts_voter_lookup ON receipts(voter_id, election_id)")
+      db.run("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_unique ON users(phone) WHERE phone IS NOT NULL AND phone != ''")
+      db.run("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_identity_reference_unique ON users(identity_reference) WHERE identity_reference IS NOT NULL AND identity_reference != ''")
+      db.run("CREATE INDEX IF NOT EXISTS idx_security_event_type ON security_events(event_type, created_at)")
+      db.run("CREATE INDEX IF NOT EXISTS face_challenges_voter_lookup ON face_verification_challenges(voter_id, expires_at)")
+      db.run("CREATE INDEX IF NOT EXISTS face_proofs_voter_lookup ON face_verification_proofs(voter_id, expires_at)")
       db.run("INSERT OR IGNORE INTO election_eligibility (voter_id, election_id) SELECT u.id, e.id FROM users u CROSS JOIN elections e WHERE u.role = 'voter'", (seedErr) => {
         if (seedErr) {
           console.error('SQLite eligibility seed failed:', seedErr)

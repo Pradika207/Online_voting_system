@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import Navbar from "../components/Navbar";
+import FaceCamera from "../components/FaceCamera";
 import { browserSupportsWebAuthn, startAuthentication, startRegistration } from "@simplewebauthn/browser";
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:5002";
@@ -14,6 +15,10 @@ function ReviewVote() {
     const [eligibilityVerified, setEligibilityVerified] = useState(false);
     const [message, setMessage] = useState("");
     const [supportsWebAuthn, setSupportsWebAuthn] = useState(false);
+    const [faceEnrolled, setFaceEnrolled] = useState(false);
+    const [faceBusy, setFaceBusy] = useState(false);
+    const [faceMode, setFaceMode] = useState(null);
+    const [faceProof, setFaceProof] = useState("");
     const isMobileDevice = (() => {
         if (typeof navigator === "undefined") return false;
         const userAgent = navigator.userAgent || "";
@@ -58,11 +63,31 @@ function ReviewVote() {
                 }
                 setMessage(error.message || "Unable to check biometric verification status.");
             });
+        fetch(`${API_BASE_URL}/api/face/status`, { headers: { Authorization: `Bearer ${token}` } })
+            .then(async (response) => {
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.message || "Unable to check camera face status.");
+                return data;
+            })
+            .then((data) => setFaceEnrolled(Boolean(data.enrolled)))
+            .catch((error) => setMessage(error.message || "Unable to check camera face status."));
         fetch(`${API_BASE_URL}/api/elections/active`, { headers: { Authorization: `Bearer ${token}` } })
             .then((response) => response.json())
             .then((data) => setElection(data.election || null))
             .catch(() => setMessage("There is no active election available."));
     }, []);
+
+    const completeFaceFlow = async (data) => {
+        setFaceBusy(false);
+        setFaceMode(null);
+        if (faceMode === "enrollment") {
+            setFaceEnrolled(true);
+            setMessage("Camera face verification enrolled. Continue with verification before voting.");
+        } else {
+            setFaceProof(data.faceProof || "");
+            setMessage("Face verified. Continue with device verification.");
+        }
+    };
 
     const ensureWebAuthnSupport = () => {
         const supported = browserSupportsWebAuthn();
@@ -127,6 +152,7 @@ function ReviewVote() {
                 }
                 throw new Error(options.message || "Unable to start biometric verification.");
             }
+            if (!faceProof) throw new Error("Complete camera face verification first.");
             let assertion;
             try {
                 assertion = await startAuthentication({ optionsJSON: options });
@@ -164,6 +190,7 @@ function ReviewVote() {
                 "Content-Type": "application/json",
                 Authorization: `Bearer ${localStorage.getItem("token")}`,
                 "X-Biometric-Token": biometricToken,
+                "X-Face-Proof": faceProof,
             },
             body: JSON.stringify({ electionId: election.id }),
         });
@@ -305,32 +332,40 @@ function ReviewVote() {
                     </div>
 
                     <div style={{ background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 18, padding: 20, marginBottom: 24 }}>
-                        <h3 style={{ marginTop: 0 }}>{isMobileDevice ? "Mobile biometric verification" : "Face authentication / device authentication"}</h3>
+                        <h3 style={{ marginTop: 0 }}>Two-factor biometric verification</h3>
                         <ul style={{ lineHeight: 1.8, paddingLeft: 20, color: "#334155" }}>
                             <li>✓ Account verified</li>
-                            <li>{biometricEnrolled ? "✓" : "○"} {isMobileDevice ? "Mobile biometric enrolled" : "Device biometric enrolled"}</li>
+                            <li>{faceEnrolled ? "✓" : "○"} Camera face template enrolled</li>
+                            <li>{biometricEnrolled ? "✓" : "○"} {isMobileDevice ? "Mobile device authentication enrolled" : "WebAuthn device authentication enrolled"}</li>
                             <li>{eligibilityVerified ? "✓" : "○"} Eligible for this election</li>
                             <li>{eligibilityVerified ? "✓ Voting status: Not yet voted" : "○ Voting status: Pending verification"}</li>
                         </ul>
                         <p style={{ color: "#475569" }}>
-                            {!supportsWebAuthn
-                                ? "This browser cannot complete a WebAuthn/passkey check. Use a supported device for secure biometric verification."
-                                : isMobileDevice
-                                    ? "Use your phone's fingerprint or face authentication. This secure check uses the existing WebAuthn/passkey flow on your device."
-                                    : "Use your computer's supported face or device authentication. This secure check uses the existing WebAuthn/passkey flow on this device."}
+                            {faceProof ? "Face verified. Complete device authentication to continue." : "Camera verification uses a live head-movement challenge and compares only with your enrolled voter template."}
                         </p>
                         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                            {!biometricEnrolled && (
-                                <button type="button" onClick={enrollBiometric} disabled={biometricBusy || !supportsWebAuthn} style={buttonSecondary}>
-                                    {biometricBusy ? "Waiting for device..." : isMobileDevice ? "Enroll mobile biometric" : "Enroll device authentication"}
+                            {!faceEnrolled && !faceMode && (
+                                <button type="button" onClick={() => { setFaceBusy(true); setFaceMode("enrollment"); }} disabled={faceBusy} style={buttonSecondary}>
+                                    Enroll camera face
                                 </button>
                             )}
-                            {biometricEnrolled && !eligibilityVerified && (
+                            {faceEnrolled && !faceProof && !faceMode && (
+                                <button type="button" onClick={() => { setFaceBusy(true); setFaceMode("verify"); }} disabled={faceBusy} style={buttonPrimary}>
+                                    Verify with camera
+                                </button>
+                            )}
+                            {!biometricEnrolled && (
+                                <button type="button" onClick={enrollBiometric} disabled={biometricBusy || !supportsWebAuthn} style={buttonSecondary}>
+                                    {biometricBusy ? "Waiting for device..." : "Enroll WebAuthn device"}
+                                </button>
+                            )}
+                            {biometricEnrolled && faceProof && !eligibilityVerified && (
                                 <button type="button" onClick={verifyBiometric} disabled={biometricBusy || !election || !supportsWebAuthn} style={buttonPrimary}>
-                                    {biometricBusy ? "Checking..." : isMobileDevice ? "Verify mobile biometric" : "Verify device authentication"}
+                                    {biometricBusy ? "Checking..." : "Verify WebAuthn device"}
                                 </button>
                             )}
                         </div>
+                        {faceMode && <FaceCamera operation={faceMode === "enrollment" ? "enrollment" : "verify"} onComplete={completeFaceFlow} onCancel={() => { setFaceBusy(false); setFaceMode(null); }} />}
                         <p style={{ minHeight: 24, color: message.toLowerCase().includes("failed") || message.toLowerCase().includes("unable") || message.toLowerCase().includes("support") || message.toLowerCase().includes("device does not support") ? "#b91c1c" : "#166534", marginBottom: 0 }}>{message || (supportsWebAuthn ? "Ready to verify" : "WebAuthn unsupported on this device")}</p>
                     </div>
 

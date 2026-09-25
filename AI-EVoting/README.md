@@ -6,7 +6,11 @@ Follow the instructions in the root README to install and run.
 
 ## Biometric Verification
 
-The voting review step uses WebAuthn platform authentication. A supported browser/device may prompt for fingerprint, face recognition, or secure device PIN. Biometric data and private keys remain on the device; the server stores only the WebAuthn credential public key and signature counter.
+The voting review step requires two separate factors: the existing WebAuthn platform authentication and camera-based face verification. WebAuthn may prompt for fingerprint, face recognition, or secure device PIN. The camera flow sends transient frames to the server-side InsightFace service, which generates an ArcFace embedding, checks exactly one face per frame, and validates an active head-movement challenge. The server compares only with the authenticated voter's encrypted template and issues a single-use proof before eligibility is granted.
+
+The camera flow does not claim depth sensing or certified presentation-attack detection. The active movement challenge is appropriate for this academic prototype, but production deployment requires an independently evaluated anti-spoofing model, liveness calibration, HTTPS, key management, consent and retention policies, and accessibility fallback procedures.
+
+To run the real camera service, install Python 3.10+ and run `pip install -r ai/face_requirements.txt`, then start `python ai/face_service.py` from this directory. The Node backend runs on port 5002 and the service runs on port 8100 by default. Set `FACE_TEMPLATE_ENCRYPTION_KEY` to a base64-encoded 32-byte secret in production and optionally configure `FACE_SIMILARITY_THRESHOLD`.
 
 For local development, the defaults are `localhost` and `http://localhost:5173`. For deployment, set `WEBAUTHN_RP_ID` to the deployment hostname and `WEBAUTHN_ORIGIN` to the exact HTTPS frontend origin. HTTPS is required outside localhost.
 
